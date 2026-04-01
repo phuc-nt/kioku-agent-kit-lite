@@ -6,6 +6,8 @@ Commands:
   kg-index        Agent-provided entity/relationship indexing for a saved memory.
   kg-alias        Register SAME_AS aliases for a canonical entity.
   kg-invalidate   Mark a knowledge graph edge as no longer valid.
+  dedup-scan      Scan entities for near-duplicates; optionally auto-merge.
+  merge           Manually merge two entities (source -> target).
   recall          Recall everything related to an entity.
   connect         Explain connection between two entities.
   entities        List top entities in the knowledge graph.
@@ -100,7 +102,11 @@ def kg_index(
     if entities:
         try:
             raw = json.loads(entities)
-            entity_list = [EntityInput(name=e["name"], type=e.get("type", "TOPIC")) for e in raw]
+            entity_list = [
+                EntityInput(name=e["name"], type=e.get("type", "TOPIC"),
+                            confidence=float(e.get("confidence", 1.0)))
+                for e in raw
+            ]
         except (json.JSONDecodeError, KeyError) as err:
             typer.echo(f"Error parsing --entities JSON: {err}", err=True)
             raise typer.Exit(1)
@@ -147,6 +153,44 @@ def kg_alias(
         typer.echo(f"Error parsing --aliases JSON: {err}", err=True)
         raise typer.Exit(1)
     _out(_get_svc().kg_alias(canonical, alias_list))
+
+
+# ── dedup-scan ────────────────────────────────────────────────────────────────
+
+@app.command(name="dedup-scan")
+def dedup_scan(
+    auto: bool = typer.Option(False, "--auto", help="Automatically merge qualifying pairs."),
+) -> None:
+    """Scan all entities for near-duplicates and surface merge candidates.
+
+    With --auto: auto-merges pairs that meet both vector and name similarity
+    thresholds (vec >= 0.98 AND name >= 0.85).
+
+    \b
+    Examples:
+      kioku-lite dedup-scan
+      kioku-lite dedup-scan --auto
+    """
+    _out(_get_svc().dedup_scan(auto_merge=auto))
+
+
+# ── merge ─────────────────────────────────────────────────────────────────────
+
+@app.command()
+def merge(
+    source: str = typer.Argument(..., help="Entity name to merge FROM (will be deleted)."),
+    target: str = typer.Argument(..., help="Entity name to merge INTO (will be kept)."),
+) -> None:
+    """Manually merge two entities: source is absorbed into target.
+
+    All edges are re-pointed, source is registered as an alias, and
+    the source node is removed.
+
+    \b
+    Example:
+      kioku-lite merge "Phuc" "Phúc"
+    """
+    _out(_get_svc().merge_entities(source, target))
 
 
 # ── kg-invalidate ─────────────────────────────────────────────────────────────

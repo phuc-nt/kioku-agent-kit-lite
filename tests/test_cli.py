@@ -350,3 +350,117 @@ class TestCLIKgInvalidate:
         result = invoke(["recall", "Phuc", "--include-historical"], env)
         data = json.loads(result.output)
         assert len(data["relationships"]) >= 1
+
+
+# ── dedup-scan CLI ────────────────────────────────────────────────────────────
+
+class TestCLIDedupScan:
+    def test_dedup_scan_exits_0(self, tmp_path):
+        env = make_env(tmp_path)
+        # Add some entities first
+        save_res = invoke(["save", "Phuc info"], env)
+        h = json.loads(save_res.output)["content_hash"]
+        ents = json.dumps([{"name": "Phuc", "type": "PERSON"}])
+        invoke(["kg-index", h, "--entities", ents], env)
+
+        # Run dedup scan
+        result = invoke(["dedup-scan"], env)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert "candidates" in data
+        assert "auto_merged" in data
+        assert "total_scanned" in data
+
+    def test_dedup_scan_returns_json(self, tmp_path):
+        env = make_env(tmp_path)
+        result = invoke(["dedup-scan"], env)
+        data = json.loads(result.output)
+        assert isinstance(data["candidates"], list)
+        assert isinstance(data["auto_merged"], list)
+
+    def test_dedup_scan_empty_graph(self, tmp_path):
+        env = make_env(tmp_path)
+        result = invoke(["dedup-scan"], env)
+        data = json.loads(result.output)
+        assert data["total_scanned"] == 0
+
+    def test_dedup_scan_auto_flag(self, tmp_path):
+        env = make_env(tmp_path)
+        # Add entities that might auto-merge
+        save_res = invoke(["save", "Phuc info"], env)
+        h = json.loads(save_res.output)["content_hash"]
+        ents = json.dumps([{"name": "Phuc", "type": "PERSON"}])
+        invoke(["kg-index", h, "--entities", ents], env)
+
+        # Run with --auto flag (should not crash)
+        result = invoke(["dedup-scan", "--auto"], env)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert "auto_merged" in data
+
+
+# ── merge CLI ──────────────────────────────────────────────────────────────────
+
+class TestCLIMerge:
+    def test_merge_exits_0(self, tmp_path):
+        env = make_env(tmp_path)
+        # Create two entities
+        save_res = invoke(["save", "Phuc info"], env)
+        h = json.loads(save_res.output)["content_hash"]
+        ents = json.dumps([{"name": "Phuc", "type": "PERSON"}, {"name": "Phúc", "type": "PERSON"}])
+        invoke(["kg-index", h, "--entities", ents], env)
+
+        # Merge them
+        result = invoke(["merge", "Phuc", "Phúc"], env)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["status"] == "merged"
+
+    def test_merge_returns_merged_status(self, tmp_path):
+        env = make_env(tmp_path)
+        save_res = invoke(["save", "Test merge"], env)
+        h = json.loads(save_res.output)["content_hash"]
+        ents = json.dumps([{"name": "A", "type": "PERSON"}, {"name": "B", "type": "PERSON"}])
+        invoke(["kg-index", h, "--entities", ents], env)
+
+        result = invoke(["merge", "A", "B"], env)
+        data = json.loads(result.output)
+        assert data["status"] == "merged"
+        assert data["source"] == "A"
+        assert data["target"] == "B"
+
+    def test_merge_nonexistent_entity(self, tmp_path):
+        env = make_env(tmp_path)
+        save_res = invoke(["save", "Single entity"], env)
+        h = json.loads(save_res.output)["content_hash"]
+        ents = json.dumps([{"name": "OnlyOne", "type": "PERSON"}])
+        invoke(["kg-index", h, "--entities", ents], env)
+
+        # Try to merge with non-existent entity
+        result = invoke(["merge", "OnlyOne", "NotExist"], env)
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["status"] == "skipped"
+
+    def test_merge_removes_source_from_entities(self, tmp_path):
+        env = make_env(tmp_path)
+        save_res = invoke(["save", "Merge test"], env)
+        h = json.loads(save_res.output)["content_hash"]
+        ents = json.dumps([{"name": "X", "type": "PERSON"}, {"name": "Y", "type": "PERSON"}])
+        invoke(["kg-index", h, "--entities", ents], env)
+
+        # Check entities before merge
+        entities_before = invoke(["entities", "--limit", "50"], env)
+        data_before = json.loads(entities_before.output)
+        names_before = [e["name"] for e in data_before["entities"]]
+        assert "X" in names_before
+
+        # Merge X into Y
+        invoke(["merge", "X", "Y"], env)
+
+        # Check entities after merge
+        entities_after = invoke(["entities", "--limit", "50"], env)
+        data_after = json.loads(entities_after.output)
+        names_after = [e["name"] for e in data_after["entities"]]
+        assert "X" not in names_after
+        assert "Y" in names_after

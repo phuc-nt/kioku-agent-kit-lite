@@ -25,6 +25,7 @@ warnings.filterwarnings(
 
 from kioku_lite.config import Settings
 from kioku_lite.pipeline.db import KiokuDB
+from kioku_lite.pipeline.dedup import DedupEngine
 from kioku_lite.pipeline.embedder import make_embedder
 from kioku_lite.search.bm25 import bm25_search
 from kioku_lite.search.graph import graph_search
@@ -42,6 +43,7 @@ JST = timezone(timedelta(hours=7))
 class EntityInput:
     name: str
     type: str = "TOPIC"
+    confidence: float = 1.0
 
 
 @dataclass
@@ -150,7 +152,38 @@ class KiokuLiteService:
         et = event_time or date
 
         for entity in entities:
-            self.db.graph.upsert_node(entity.name, entity.type, date)
+            self.db.graph.upsert_node(entity.name, entity.type, date, confidence=entity.confidence)
+
+        # Dedup: find and auto-merge near-duplicate entities
+        dedup_engine = DedupEngine()
+        all_auto_merged = []
+        all_candidates = []
+        for entity in entities:
+            try:
+                dedup_result = dedup_engine.find_similar(
+                    entity.name, self.embedder, self.db.conn
+                )
+                for action in dedup_result.auto_merged:
+                    merge_out = self.db.graph.merge_entities(
+                        action.source_name, action.target_name,
+                        "auto", action.vector_sim, action.name_sim,
+                    )
+                    if merge_out.get("status") == "merged":
+                        all_auto_merged.append({
+                            "source": action.source_name,
+                            "target": action.target_name,
+                            "vector_sim": round(action.vector_sim, 4),
+                            "name_sim": round(action.name_sim, 4),
+                        })
+                for cand in dedup_result.candidates:
+                    all_candidates.append({
+                        "source": cand.source_name,
+                        "target": cand.target_name,
+                        "vector_sim": round(cand.vector_sim, 4),
+                        "name_sim": round(cand.name_sim, 4),
+                    })
+            except Exception as e:
+                log.warning("Dedup failed for entity '%s': %s", entity.name, e)
 
         for rel in relationships:
             self.db.graph.upsert_edge(
@@ -173,6 +206,8 @@ class KiokuLiteService:
             "content_hash": content_hash,
             "entities_added": len(entities),
             "relationships_added": len(relationships),
+            "auto_merged": all_auto_merged,
+            "dedup_candidates": all_candidates,
         }
 
     # ── kg_invalidate ──────────────────────────────────────────────────────────
@@ -207,6 +242,52 @@ class KiokuLiteService:
                 self.db.graph.add_alias(alias, canonical)
                 added.append(alias)
         return {"status": "ok", "canonical": canonical, "aliases_added": added}
+
+    # ── dedup ──────────────────────────────────────────────────────────────────
+
+    def dedup_scan(self, auto_merge: bool = False) -> dict:
+        """Scan all entities for near-duplicates.
+
+        If auto_merge=True, automatically merges pairs that meet both
+        vec_auto + name_auto thresholds.
+        """
+        engine = DedupEngine()
+        candidates = engine.scan_all(self.db.conn, self.embedder)
+        merged = []
+        remaining_candidates = []
+
+        for cand in candidates:
+            if (auto_merge
+                    and cand.vector_sim >= engine.vec_auto
+                    and cand.name_sim >= engine.name_auto):
+                result = self.db.graph.merge_entities(
+                    cand.source_name, cand.target_name,
+                    "auto", cand.vector_sim, cand.name_sim,
+                )
+                if result.get("status") == "merged":
+                    merged.append({
+                        "source": cand.source_name,
+                        "target": cand.target_name,
+                        "vector_sim": round(cand.vector_sim, 4),
+                        "name_sim": round(cand.name_sim, 4),
+                    })
+                    continue
+            remaining_candidates.append({
+                "source": cand.source_name,
+                "target": cand.target_name,
+                "vector_sim": round(cand.vector_sim, 4),
+                "name_sim": round(cand.name_sim, 4),
+            })
+
+        return {
+            "candidates": remaining_candidates,
+            "auto_merged": merged,
+            "total_scanned": len(candidates),
+        }
+
+    def merge_entities(self, source: str, target: str) -> dict:
+        """Manually merge source entity into target (alias + edge re-point)."""
+        return self.db.graph.merge_entities(source, target, merge_type="manual")
 
     # ── search_memories ────────────────────────────────────────────────────────
 

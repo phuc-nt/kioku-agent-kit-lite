@@ -26,19 +26,24 @@ class GraphStore:
 
     # ── Upsert ─────────────────────────────────────────────────────────────────
 
-    def upsert_node(self, name: str, entity_type: str, date: str) -> None:
-        """Insert or update entity node, incrementing mention_count."""
+    def upsert_node(self, name: str, entity_type: str, date: str, confidence: float = 1.0) -> None:
+        """Insert or update entity node, incrementing mention_count.
+
+        Confidence uses MAX strategy: re-upserting with a higher value raises it,
+        but never lowers it.
+        """
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO kg_nodes (name, type, mention_count, first_seen, last_seen)
-            VALUES (?, ?, 1, ?, ?)
+            INSERT INTO kg_nodes (name, type, mention_count, first_seen, last_seen, confidence)
+            VALUES (?, ?, 1, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 mention_count = mention_count + 1,
                 last_seen = excluded.last_seen,
-                type = CASE WHEN excluded.type != '' THEN excluded.type ELSE type END
+                type = CASE WHEN excluded.type != '' THEN excluded.type ELSE type END,
+                confidence = MAX(confidence, excluded.confidence)
             """,
-            (name, entity_type, date, date),
+            (name, entity_type, date, date, confidence),
         )
         self.conn.commit()
 
@@ -127,7 +132,7 @@ class GraphStore:
         cur = self.conn.cursor()
         cur.execute(
             """
-            SELECT n.name, n.type, n.mention_count,
+            SELECT n.name, n.type, n.mention_count, n.confidence,
                    GROUP_CONCAT(a.alias, '|||') AS aliases
             FROM kg_nodes n
             LEFT JOIN kg_aliases a ON a.canonical = n.name COLLATE NOCASE
@@ -142,28 +147,45 @@ class GraphStore:
                 "name": r[0],
                 "type": r[1] or "",
                 "mentions": r[2] or 0,
-                "aliases": [x for x in (r[3] or "").split("|||") if x],
+                "confidence": r[3] if r[3] is not None else 1.0,
+                "aliases": [x for x in (r[4] or "").split("|||") if x],
             }
             for r in cur.fetchall()
         ]
 
-    def search_nodes(self, query: str, limit: int = 30) -> list[GraphNode]:
-        """Case-insensitive substring search, re-ranked by match quality."""
+    def search_nodes(self, query: str, limit: int = 30, min_confidence: float = 0.0) -> list[GraphNode]:
+        """Case-insensitive substring search, re-ranked by match quality.
+
+        min_confidence: if > 0, excludes nodes with confidence below threshold.
+        """
         cur = self.conn.cursor()
-        cur.execute(
-            """
-            SELECT name, type, mention_count, first_seen, last_seen
-            FROM kg_nodes
-            WHERE name LIKE ? COLLATE NOCASE
-            ORDER BY mention_count DESC
-            LIMIT ?
-            """,
-            (f"%{query}%", limit),
-        )
+        if min_confidence > 0.0:
+            cur.execute(
+                """
+                SELECT name, type, mention_count, first_seen, last_seen, confidence
+                FROM kg_nodes
+                WHERE name LIKE ? COLLATE NOCASE AND confidence >= ?
+                ORDER BY mention_count DESC
+                LIMIT ?
+                """,
+                (f"%{query}%", min_confidence, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT name, type, mention_count, first_seen, last_seen, confidence
+                FROM kg_nodes
+                WHERE name LIKE ? COLLATE NOCASE
+                ORDER BY mention_count DESC
+                LIMIT ?
+                """,
+                (f"%{query}%", limit),
+            )
         nodes = [
             GraphNode(
                 name=r[0], type=r[1] or "", mention_count=r[2] or 0,
                 first_seen=r[3] or "", last_seen=r[4] or "",
+                confidence=r[5] if r[5] is not None else 1.0,
             )
             for r in cur.fetchall()
         ]
@@ -310,11 +332,11 @@ class GraphStore:
         self._enrich_nodes(nodes_map)
 
     def _enrich_nodes(self, nodes_map: dict[str, GraphNode]) -> None:
-        """Fill in type/mention_count/dates for collected nodes."""
+        """Fill in type/mention_count/dates/confidence for collected nodes."""
         cur = self.conn.cursor()
         for key, node in list(nodes_map.items()):
             cur.execute(
-                "SELECT name, type, mention_count, first_seen, last_seen "
+                "SELECT name, type, mention_count, first_seen, last_seen, confidence "
                 "FROM kg_nodes WHERE name = ? COLLATE NOCASE",
                 (node.name,),
             )
@@ -323,7 +345,120 @@ class GraphStore:
                 nodes_map[key] = GraphNode(
                     name=row[0], type=row[1] or "", mention_count=row[2] or 0,
                     first_seen=row[3] or "", last_seen=row[4] or "",
+                    confidence=row[5] if row[5] is not None else 1.0,
                 )
+
+    # ── Merge ──────────────────────────────────────────────────────────────────
+
+    def merge_entities(
+        self,
+        source: str,
+        target: str,
+        merge_type: str = "auto",
+        vector_sim: float = 0.0,
+        name_sim: float = 0.0,
+    ) -> dict:
+        """Atomically merge source entity into target.
+
+        - Re-points all edges from source to target
+        - Deduplicates edges after re-pointing (keep lowest id per src+tgt+rel_type)
+        - Accumulates mention_count from source into target
+        - Registers source as alias of target
+        - Logs merge to kg_merge_log
+        - Deletes source node
+
+        Returns status dict. No-ops if source == target (case-insensitive) or
+        source does not exist.
+        """
+        if source.strip().lower() == target.strip().lower():
+            return {"status": "skipped", "reason": "self-merge"}
+
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT mention_count FROM kg_nodes WHERE name = ? COLLATE NOCASE",
+            (source,),
+        )
+        src_row = cur.fetchone()
+        if not src_row:
+            return {"status": "skipped", "reason": "source not found"}
+
+        cur.execute(
+            "SELECT name FROM kg_nodes WHERE name = ? COLLATE NOCASE",
+            (target,),
+        )
+        if not cur.fetchone():
+            return {"status": "skipped", "reason": "target not found"}
+
+        src_mentions = src_row[0] or 0
+
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        cur.execute("SAVEPOINT merge_entity")
+        try:
+            # Re-point edges where source is the source
+            cur.execute(
+                "UPDATE kg_edges SET source = ? WHERE source = ? COLLATE NOCASE",
+                (target, source),
+            )
+            # Re-point edges where source is the target
+            cur.execute(
+                "UPDATE kg_edges SET target = ? WHERE target = ? COLLATE NOCASE",
+                (target, source),
+            )
+            # Remove self-loops created by re-pointing (source->source becomes target->target)
+            cur.execute(
+                "DELETE FROM kg_edges WHERE source = ? AND target = ? COLLATE NOCASE",
+                (target, target),
+            )
+            # Dedup edges: keep lowest id per (source, target, rel_type)
+            cur.execute(
+                """
+                DELETE FROM kg_edges WHERE id NOT IN (
+                    SELECT MIN(id) FROM kg_edges GROUP BY source, target, rel_type
+                )
+                """
+            )
+            # Accumulate mention_count into target
+            cur.execute(
+                "UPDATE kg_nodes SET mention_count = mention_count + ? WHERE name = ? COLLATE NOCASE",
+                (src_mentions, target),
+            )
+            # Register source as alias of target (reuse existing method logic inline
+            # to avoid commit inside SAVEPOINT)
+            cur.execute(
+                "INSERT OR IGNORE INTO kg_aliases (alias, canonical) VALUES (?, ?)",
+                (source, target),
+            )
+            cur.execute(
+                "UPDATE kg_nodes SET is_canonical = 1 WHERE name = ? COLLATE NOCASE",
+                (target,),
+            )
+            # Log merge
+            cur.execute(
+                """
+                INSERT INTO kg_merge_log
+                    (source_name, target_name, merge_type, vector_sim, name_sim, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (source, target, merge_type, vector_sim, name_sim, ts),
+            )
+            # Delete source node
+            cur.execute(
+                "DELETE FROM kg_nodes WHERE name = ? COLLATE NOCASE",
+                (source,),
+            )
+            cur.execute("RELEASE merge_entity")
+            self.conn.commit()
+        except Exception:
+            cur.execute("ROLLBACK TO merge_entity")
+            cur.execute("RELEASE merge_entity")
+            raise
+
+        log.info("Merged '%s' → '%s' (%s, vec=%.3f, name=%.3f)",
+                 source, target, merge_type, vector_sim, name_sim)
+        return {"status": "merged", "source": source, "target": target,
+                "merge_type": merge_type, "vector_sim": vector_sim, "name_sim": name_sim}
 
     # ── Export ─────────────────────────────────────────────────────────────────
 
@@ -333,7 +468,7 @@ class GraphStore:
         cur.execute(
             """
             SELECT n.name, n.type, n.mention_count, n.first_seen, n.last_seen,
-                   GROUP_CONCAT(a.alias, '|||') AS aliases
+                   n.confidence, GROUP_CONCAT(a.alias, '|||') AS aliases
             FROM kg_nodes n
             LEFT JOIN kg_aliases a ON a.canonical = n.name COLLATE NOCASE
             GROUP BY n.name
@@ -348,7 +483,8 @@ class GraphStore:
                 "mentions": r[2] or 0,
                 "first_seen": r[3] or "",
                 "last_seen": r[4] or "",
-                "aliases": [x for x in (r[5] or "").split("|||") if x],
+                "confidence": r[5] if r[5] is not None else 1.0,
+                "aliases": [x for x in (r[6] or "").split("|||") if x],
             }
             for r in cur.fetchall()
         ]

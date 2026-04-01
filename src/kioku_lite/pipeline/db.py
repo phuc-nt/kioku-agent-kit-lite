@@ -159,6 +159,12 @@ class KiokuDB:
             except sqlite3.OperationalError:
                 pass
 
+        # Migrations for older DBs
+        try:
+            cur.execute("ALTER TABLE kg_nodes ADD COLUMN confidence REAL DEFAULT 1.0")
+        except sqlite3.OperationalError:
+            pass
+
         # SAME_AS alias mapping
         cur.execute("""
             CREATE TABLE IF NOT EXISTS kg_aliases (
@@ -170,6 +176,19 @@ class KiokuDB:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_alias ON kg_aliases(alias COLLATE NOCASE)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_canonical ON kg_aliases(canonical COLLATE NOCASE)")
+
+        # Merge audit log
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS kg_merge_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_name TEXT NOT NULL,
+                target_name TEXT NOT NULL,
+                merge_type TEXT DEFAULT 'auto',
+                vector_sim REAL DEFAULT 0.0,
+                name_sim REAL DEFAULT 0.0,
+                timestamp TEXT NOT NULL
+            )
+        """)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 

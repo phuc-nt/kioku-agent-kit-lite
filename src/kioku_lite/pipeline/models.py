@@ -30,6 +30,7 @@ class GraphNode:
     mention_count: int = 0
     first_seen: str = ""
     last_seen: str = ""
+    confidence: float = 1.0
 
 
 @dataclass
