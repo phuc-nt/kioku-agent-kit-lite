@@ -41,6 +41,8 @@ class GraphEdge:
     weight: float = 0.5
     evidence: str = ""
     source_hash: str = ""   # links back to SQLite memories for hydration
+    valid_from: str = ""           # when fact became true ('' = unknown)
+    valid_until: str | None = None  # when fact stopped being true (None = current)
 
 
 @dataclass

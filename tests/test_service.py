@@ -309,3 +309,31 @@ class TestTemporalRange:
         df, dt = service._extract_temporal_range("something from 2024")
         assert df == "2024-01-01"
         assert dt == "2024-12-31"
+
+
+# ── temporal fact management ─────────────────────────────────────────────────
+
+class TestTemporalFactManagement:
+    def test_kg_index_sets_valid_from(self, service):
+        from kioku_lite.service import EntityInput, RelationshipInput
+        service.save_memory("Phuc works at Google")
+        h = service.save_memory("Phuc works at Google")["content_hash"]
+        rels = [RelationshipInput(source="Phuc", target="Google", rel_type="WORKS_AT", weight=0.9)]
+        service.kg_index(h, [EntityInput("Phuc"), EntityInput("Google")], rels, event_time="2026-04-01")
+        edges = service.db.graph.get_all_edges()
+        works_at = [e for e in edges if e["relation"] == "WORKS_AT"]
+        assert works_at[0]["valid_from"] == "2026-04-01"
+
+    def test_kg_invalidate_success(self, service):
+        from kioku_lite.service import EntityInput, RelationshipInput
+        h = service.save_memory("Phuc works at LINE")["content_hash"]
+        rels = [RelationshipInput(source="Phuc", target="LINE", rel_type="WORKS_AT", weight=0.9)]
+        service.kg_index(h, [EntityInput("Phuc"), EntityInput("LINE")], rels)
+        result = service.kg_invalidate(source="Phuc", target="LINE", rel_type="WORKS_AT", valid_until="2026-03-31")
+        assert result["status"] == "invalidated"
+        assert result["edges_updated"] == 1
+
+    def test_kg_invalidate_no_match(self, service):
+        result = service.kg_invalidate(source="X", target="Y")
+        assert result["status"] == "no_match"
+        assert result["edges_updated"] == 0

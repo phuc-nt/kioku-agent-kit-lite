@@ -23,6 +23,7 @@ def graph_search(
     query: str,
     limit: int = 20,
     entities: list[str] | None = None,
+    include_historical: bool = False,
 ) -> list[SearchResult]:
     """Search the knowledge graph by entity traversal.
 
@@ -74,7 +75,7 @@ def graph_search(
     orphan_results: list[SearchResult] = []
 
     for entity in ranked_seeds:
-        traversal = store.traverse(entity.name, max_hops=2, limit=limit)
+        traversal = store.traverse(entity.name, max_hops=2, limit=limit, include_historical=include_historical)
         entity_hashes: set[str] = set()
         for edge in traversal.edges:
             r = SearchResult(

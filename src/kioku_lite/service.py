@@ -59,8 +59,7 @@ class KiokuLiteService:
     """Core business logic for Kioku Lite. Used by CLI only (no MCP)."""
 
     def __init__(self, settings: Settings | None = None) -> None:
-        from kioku_lite.config import settings as default_settings
-        self.settings = settings or default_settings
+        self.settings = settings or Settings()
         self.settings.ensure_dirs()
 
         self.db = KiokuDB(self.settings.db_path, embed_dim=self.settings.embed_dim)
@@ -162,6 +161,7 @@ class KiokuLiteService:
                 evidence=rel.evidence,
                 source_hash=content_hash,
                 event_time=et,
+                valid_from=et,
             )
 
         log.info(
@@ -173,6 +173,28 @@ class KiokuLiteService:
             "content_hash": content_hash,
             "entities_added": len(entities),
             "relationships_added": len(relationships),
+        }
+
+    # ── kg_invalidate ──────────────────────────────────────────────────────────
+
+    def kg_invalidate(
+        self,
+        source: str,
+        target: str,
+        rel_type: str | None = None,
+        valid_until: str | None = None,
+        reason: str = "",
+    ) -> dict:
+        """Mark edge(s) as no longer valid (superseded by newer facts)."""
+        date = valid_until or datetime.now(JST).strftime("%Y-%m-%d")
+        count = self.db.graph.invalidate_edge(
+            valid_until=date, source=source, target=target, rel_type=rel_type,
+        )
+        return {
+            "status": "invalidated" if count > 0 else "no_match",
+            "edges_updated": count,
+            "valid_until": date,
+            "reason": reason,
         }
 
     # ── kg_alias ───────────────────────────────────────────────────────────────
@@ -195,6 +217,7 @@ class KiokuLiteService:
         date_from: str | None = None,
         date_to: str | None = None,
         entities: list[str] | None = None,
+        include_historical: bool = False,
     ) -> dict:
         """Tri-hybrid search: BM25 + Vector + Graph → RRF rerank → SQLite hydration."""
         clean_query = re.sub(r"[^\w\s]", " ", query)
@@ -214,11 +237,11 @@ class KiokuLiteService:
             entity_lower = [e.lower() for e in entities]
             vec_results = [r for r in vec_all if any(ent in r.content.lower() for ent in entity_lower)]
 
-            kg_results = graph_search(self.db.graph, query, limit=limit * 3, entities=entities)
+            kg_results = graph_search(self.db.graph, query, limit=limit * 3, entities=entities, include_historical=include_historical)
         else:
             bm25_results = bm25_search(self.db.memory, clean_query, limit=limit * 3)
             vec_results = vector_search(self.db.memory, self.embedder, query, limit=limit * 3)
-            kg_results = graph_search(self.db.graph, query, limit=limit * 3)
+            kg_results = graph_search(self.db.graph, query, limit=limit * 3, include_historical=include_historical)
 
         results = rrf_rerank(bm25_results, vec_results, kg_results, limit=limit)
 
@@ -312,9 +335,11 @@ class KiokuLiteService:
 
     # ── recall / explain ───────────────────────────────────────────────────────
 
-    def recall_entity(self, entity: str, max_hops: int = 2, limit: int = 10) -> dict:
+    def recall_entity(
+        self, entity: str, max_hops: int = 2, limit: int = 10, include_historical: bool = False,
+    ) -> dict:
         """Recall everything related to an entity via graph traversal + hydration."""
-        result = self.db.graph.traverse(entity, max_hops=max_hops, limit=limit)
+        result = self.db.graph.traverse(entity, max_hops=max_hops, limit=limit, include_historical=include_historical)
         hashes = list({e.source_hash for e in result.edges if e.source_hash})
         hydrated = self.db.memory.get_by_hashes(hashes) if hashes else {}
 
@@ -329,9 +354,11 @@ class KiokuLiteService:
             ],
         }
 
-    def explain_connection(self, entity_a: str, entity_b: str) -> dict:
+    def explain_connection(
+        self, entity_a: str, entity_b: str, include_historical: bool = False,
+    ) -> dict:
         """Find and explain the path between two entities in the graph."""
-        result = self.db.graph.find_path(entity_a, entity_b)
+        result = self.db.graph.find_path(entity_a, entity_b, include_historical=include_historical)
         hashes = list({e.source_hash for e in result.edges if e.source_hash})
         hydrated = self.db.memory.get_by_hashes(hashes) if hashes else {}
 

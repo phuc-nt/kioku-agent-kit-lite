@@ -144,11 +144,20 @@ class KiokuDB:
                 evidence TEXT DEFAULT '',
                 source_hash TEXT DEFAULT '',
                 event_time TEXT DEFAULT '',
+                valid_from TEXT DEFAULT '',
+                valid_until TEXT DEFAULT NULL,
                 UNIQUE(source, target, rel_type)
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_edges_src ON kg_edges(source COLLATE NOCASE)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_edges_tgt ON kg_edges(target COLLATE NOCASE)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_edges_valid ON kg_edges(valid_until)")
+        # Migrations for older DBs
+        for col, default in [("valid_from", "''"), ("valid_until", "NULL")]:
+            try:
+                cur.execute(f"ALTER TABLE kg_edges ADD COLUMN {col} TEXT DEFAULT {default}")
+            except sqlite3.OperationalError:
+                pass
 
         # SAME_AS alias mapping
         cur.execute("""

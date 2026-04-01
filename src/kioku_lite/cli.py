@@ -1,17 +1,18 @@
 """Kioku Lite CLI — zero Docker, zero cloud LLM.
 
 Commands:
-  save          Save a memory. Returns content_hash for kg-index.
-  search        Tri-hybrid search (BM25 + Vector + Graph).
-  kg-index      Agent-provided entity/relationship indexing for a saved memory.
-  kg-alias      Register SAME_AS aliases for a canonical entity.
-  recall        Recall everything related to an entity.
-  connect       Explain connection between two entities.
-  entities      List top entities in the knowledge graph.
-  timeline      Chronological memory list.
-  export-graph  Export knowledge graph as interactive HTML or JSON.
-  setup         First-time setup (download embedding model, create config).
-  init          Generate CLAUDE.md + SKILL.md for Claude Code / Cursor.
+  save            Save a memory. Returns content_hash for kg-index.
+  search          Tri-hybrid search (BM25 + Vector + Graph).
+  kg-index        Agent-provided entity/relationship indexing for a saved memory.
+  kg-alias        Register SAME_AS aliases for a canonical entity.
+  kg-invalidate   Mark a knowledge graph edge as no longer valid.
+  recall          Recall everything related to an entity.
+  connect         Explain connection between two entities.
+  entities        List top entities in the knowledge graph.
+  timeline        Chronological memory list.
+  export-graph    Export knowledge graph as interactive HTML or JSON.
+  setup           First-time setup (download embedding model, create config).
+  init            Generate CLAUDE.md + SKILL.md for Claude Code / Cursor.
 """
 
 from __future__ import annotations
@@ -148,6 +149,29 @@ def kg_alias(
     _out(_get_svc().kg_alias(canonical, alias_list))
 
 
+# ── kg-invalidate ─────────────────────────────────────────────────────────────
+
+@app.command(name="kg-invalidate")
+def kg_invalidate(
+    source: str = typer.Option(..., "--source", "-s", help="Source entity."),
+    target: str = typer.Option(..., "--target", "-t", help="Target entity."),
+    rel_type: Optional[str] = typer.Option(None, "--rel-type", "-r", help="Relationship type (optional)."),
+    date: Optional[str] = typer.Option(None, "--date", "-d", help="When fact became invalid (YYYY-MM-DD). Defaults to today."),
+    reason: Optional[str] = typer.Option("", "--reason", help="Why this fact is no longer valid."),
+) -> None:
+    """Mark a knowledge graph edge as no longer valid (superseded).
+
+    \b
+    Example — Phuc changed jobs:
+      kioku-lite kg-invalidate --source Phuc --target LINE --rel-type WORKS_AT --date 2026-03-31
+    """
+    result = _get_svc().kg_invalidate(
+        source=source, target=target, rel_type=rel_type,
+        valid_until=date, reason=reason or "",
+    )
+    _out(result)
+
+
 # ── search ─────────────────────────────────────────────────────────────────────
 
 @app.command()
@@ -157,10 +181,14 @@ def search(
     date_from: Optional[str] = typer.Option(None, "--from", help="Start date YYYY-MM-DD."),
     date_to: Optional[str] = typer.Option(None, "--to", help="End date YYYY-MM-DD."),
     entities: Optional[str] = typer.Option(None, "--entities", "-e", help="Comma-separated entity names for KG seeding."),
+    include_historical: bool = typer.Option(False, "--include-historical", help="Include superseded facts."),
 ) -> None:
     """Tri-hybrid search: BM25 + Vector (FastEmbed) + Knowledge Graph → RRF rerank."""
     entity_list = [e.strip() for e in entities.split(",")] if entities else None
-    _out(_get_svc().search_memories(query, limit=limit, date_from=date_from, date_to=date_to, entities=entity_list))
+    _out(_get_svc().search_memories(
+        query, limit=limit, date_from=date_from, date_to=date_to,
+        entities=entity_list, include_historical=include_historical,
+    ))
 
 
 # ── recall ─────────────────────────────────────────────────────────────────────
@@ -170,9 +198,10 @@ def recall(
     entity: str = typer.Argument(..., help="Entity name to recall memories for."),
     hops: int = typer.Option(2, "--hops", help="Graph traversal depth."),
     limit: int = typer.Option(10, "--limit", "-l"),
+    include_historical: bool = typer.Option(False, "--include-historical", help="Include superseded facts."),
 ) -> None:
     """Recall all memories related to an entity via knowledge graph traversal."""
-    _out(_get_svc().recall_entity(entity, max_hops=hops, limit=limit))
+    _out(_get_svc().recall_entity(entity, max_hops=hops, limit=limit, include_historical=include_historical))
 
 
 # ── connect ────────────────────────────────────────────────────────────────────
@@ -181,9 +210,10 @@ def recall(
 def connect(
     entity_a: str = typer.Argument(...),
     entity_b: str = typer.Argument(...),
+    include_historical: bool = typer.Option(False, "--include-historical", help="Include superseded facts."),
 ) -> None:
     """Explain how two entities are connected in the knowledge graph."""
-    _out(_get_svc().explain_connection(entity_a, entity_b))
+    _out(_get_svc().explain_connection(entity_a, entity_b, include_historical=include_historical))
 
 
 # ── entities ───────────────────────────────────────────────────────────────────

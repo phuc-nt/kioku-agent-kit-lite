@@ -15,9 +15,11 @@ runner = CliRunner()
 
 @pytest.fixture(autouse=True)
 def reset_service_singleton():
-    """Reset the global _svc singleton between tests for proper isolation."""
+    """Reset the global _svc singleton and config between tests for proper isolation."""
     import kioku_lite.cli as _cli_module
+    import kioku_lite.config as _cfg_module
     _cli_module._svc = None
+    _orig_settings = _cfg_module.settings
     yield
     if _cli_module._svc is not None:
         try:
@@ -25,6 +27,7 @@ def reset_service_singleton():
         except Exception:
             pass
     _cli_module._svc = None
+    _cfg_module.settings = _orig_settings
 
 
 def make_env(tmp_path: Path) -> dict:
@@ -306,3 +309,44 @@ class TestE2EWorkflow:
         recall_data = json.loads(recall_result.output)
         node_names = [n["name"] for n in recall_data["nodes"]]
         assert "LINE" in node_names
+
+
+# ── kg-invalidate CLI ─────────────────────────────────────────────────────────
+
+class TestCLIKgInvalidate:
+    def test_kg_invalidate_exits_0(self, tmp_path):
+        env = make_env(tmp_path)
+        save_res = invoke(["save", "Phuc works at LINE"], env)
+        h = json.loads(save_res.output)["content_hash"]
+        ents = json.dumps([{"name": "Phuc", "type": "PERSON"}, {"name": "LINE", "type": "ORG"}])
+        rels = json.dumps([{"source": "Phuc", "target": "LINE", "rel_type": "WORKS_AT", "weight": 0.9}])
+        invoke(["kg-index", h, "--entities", ents, "--relationships", rels], env)
+        result = invoke(["kg-invalidate", "--source", "Phuc", "--target", "LINE"], env)
+        assert result.exit_code == 0, result.output
+        data = json.loads(result.output)
+        assert data["status"] == "invalidated"
+        assert data["edges_updated"] == 1
+
+    def test_kg_invalidate_no_match(self, tmp_path):
+        env = make_env(tmp_path)
+        result = invoke(["kg-invalidate", "--source", "X", "--target", "Y"], env)
+        assert result.exit_code == 0
+        data = json.loads(result.output)
+        assert data["status"] == "no_match"
+
+    def test_recall_include_historical(self, tmp_path):
+        env = make_env(tmp_path)
+        save_res = invoke(["save", "Phuc works at LINE"], env)
+        h = json.loads(save_res.output)["content_hash"]
+        ents = json.dumps([{"name": "Phuc", "type": "PERSON"}, {"name": "LINE", "type": "ORG"}])
+        rels = json.dumps([{"source": "Phuc", "target": "LINE", "rel_type": "WORKS_AT", "weight": 0.9}])
+        invoke(["kg-index", h, "--entities", ents, "--relationships", rels], env)
+        invoke(["kg-invalidate", "--source", "Phuc", "--target", "LINE", "--date", "2026-03-31"], env)
+        # Default recall: no edges (invalidated)
+        result = invoke(["recall", "Phuc"], env)
+        data = json.loads(result.output)
+        assert len(data["relationships"]) == 0
+        # With --include-historical: edge is back
+        result = invoke(["recall", "Phuc", "--include-historical"], env)
+        data = json.loads(result.output)
+        assert len(data["relationships"]) >= 1

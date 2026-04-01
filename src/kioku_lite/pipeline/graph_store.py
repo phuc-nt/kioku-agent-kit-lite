@@ -51,22 +51,55 @@ class GraphStore:
         evidence: str,
         source_hash: str,
         event_time: str = "",
+        valid_from: str = "",
     ) -> None:
-        """Insert or update relationship edge, averaging weights on conflict."""
+        """Insert or update relationship edge, averaging weights on conflict.
+
+        ON CONFLICT does NOT touch valid_from/valid_until — re-indexing same
+        fact should not un-invalidate it.
+        """
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO kg_edges (source, target, rel_type, weight, evidence, source_hash, event_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO kg_edges
+                (source, target, rel_type, weight, evidence, source_hash, event_time, valid_from)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source, target, rel_type) DO UPDATE SET
                 weight = (weight + excluded.weight) / 2,
                 evidence = excluded.evidence,
                 source_hash = excluded.source_hash,
                 event_time = excluded.event_time
             """,
-            (source, target, rel_type, weight, evidence, source_hash, event_time),
+            (source, target, rel_type, weight, evidence, source_hash, event_time, valid_from),
         )
         self.conn.commit()
+
+    def invalidate_edge(
+        self,
+        valid_until: str,
+        source: str | None = None,
+        target: str | None = None,
+        rel_type: str | None = None,
+    ) -> int:
+        """Mark edge(s) as no longer valid. Returns count of rows updated."""
+        clauses: list[str] = []
+        params: list[str] = [valid_until]  # SET valid_until = ? comes first
+        if source:
+            clauses.append("source = ? COLLATE NOCASE")
+            params.append(source)
+        if target:
+            clauses.append("target = ? COLLATE NOCASE")
+            params.append(target)
+        if rel_type:
+            clauses.append("rel_type = ? COLLATE NOCASE")
+            params.append(rel_type)
+        if not clauses:
+            return 0
+        sql = f"UPDATE kg_edges SET valid_until = ? WHERE {' AND '.join(clauses)}"
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        self.conn.commit()
+        return cur.rowcount
 
     def add_alias(self, alias: str, canonical: str) -> None:
         """Register an alias → canonical SAME_AS mapping. Skips if alias == canonical."""
@@ -177,11 +210,18 @@ class GraphStore:
         row = cur.fetchone()
         return row[0] if row else 0
 
-    def traverse(self, entity_name: str, max_hops: int = 2, limit: int = 20) -> GraphSearchResult:
+    def traverse(
+        self,
+        entity_name: str,
+        max_hops: int = 2,
+        limit: int = 20,
+        include_historical: bool = False,
+    ) -> GraphSearchResult:
         """BFS traversal from seed entity, following SAME_AS aliases.
 
         Uses adaptive hop limit (Task 1C): hub nodes with degree > 15 are
         capped at 1 hop to avoid returning the majority of the DB.
+        By default only follows currently-valid edges (valid_until IS NULL).
         """
         seeds = self._resolve_names(entity_name)
 
@@ -194,7 +234,7 @@ class GraphStore:
         seen: set[str] = set()
 
         for seed in seeds:
-            self._bfs(seed, effective_hops, limit, nodes_map, edges, seen)
+            self._bfs(seed, effective_hops, limit, nodes_map, edges, seen, include_historical)
 
         return GraphSearchResult(nodes=list(nodes_map.values()), edges=edges[:limit])
 
@@ -222,33 +262,42 @@ class GraphStore:
         nodes_map: dict[str, GraphNode],
         edges: list[GraphEdge],
         seen: set[str],
+        include_historical: bool = False,
     ) -> None:
-        """BFS from start, collecting up to `limit` edges."""
+        """BFS from start, collecting up to `limit` edges.
+
+        By default only traverses valid edges (valid_until IS NULL).
+        """
         queue: deque[tuple[str, int]] = deque([(start, 0)])
         visited: set[str] = {start.lower()}
         cur = self.conn.cursor()
+
+        validity_clause = "" if include_historical else "AND valid_until IS NULL"
 
         while queue and len(edges) < limit:
             current, depth = queue.popleft()
             if depth >= max_hops:
                 continue
             cur.execute(
-                """
-                SELECT source, target, rel_type, weight, evidence, source_hash
+                f"""
+                SELECT source, target, rel_type, weight, evidence, source_hash,
+                       valid_from, valid_until
                 FROM kg_edges
-                WHERE source = ? COLLATE NOCASE OR target = ? COLLATE NOCASE
+                WHERE (source = ? COLLATE NOCASE OR target = ? COLLATE NOCASE)
+                    {validity_clause}
                 ORDER BY weight DESC LIMIT 50
                 """,
                 (current, current),
             )
             for row in cur.fetchall():
-                src, tgt, rel, weight, evidence, src_hash = row
+                src, tgt, rel, weight, evidence, src_hash, vf, vu = row
                 key = f"{src.lower()}|{tgt.lower()}|{rel}|{src_hash}"
                 if key not in seen:
                     seen.add(key)
                     edges.append(GraphEdge(
                         source=src, target=tgt, rel_type=rel,
                         weight=weight, evidence=evidence or "", source_hash=src_hash or "",
+                        valid_from=vf or "", valid_until=vu,
                     ))
                     nodes_map[src.lower()] = GraphNode(name=src, type="")
                     nodes_map[tgt.lower()] = GraphNode(name=tgt, type="")
@@ -305,11 +354,12 @@ class GraphStore:
         ]
 
     def get_all_edges(self) -> list[dict]:
-        """Return all edges for graph export."""
+        """Return all edges for graph export (includes temporal validity)."""
         cur = self.conn.cursor()
         cur.execute(
             """
-            SELECT source, target, rel_type, weight, evidence, event_time
+            SELECT source, target, rel_type, weight, evidence, event_time,
+                   valid_from, valid_until
             FROM kg_edges
             ORDER BY weight DESC
             """
@@ -322,14 +372,21 @@ class GraphStore:
                 "weight": r[3] or 0.5,
                 "evidence": r[4] or "",
                 "event_time": r[5] or "",
+                "valid_from": r[6] or "",
+                "valid_until": r[7],
             }
             for r in cur.fetchall()
         ]
 
-    def find_path(self, source: str, target: str) -> GraphSearchResult:
+    def find_path(
+        self, source: str, target: str, include_historical: bool = False,
+    ) -> GraphSearchResult:
         """BFS shortest path between two entities (undirected)."""
         cur = self.conn.cursor()
-        cur.execute("SELECT source, target, rel_type, evidence, source_hash FROM kg_edges")
+        validity_clause = "" if include_historical else "WHERE valid_until IS NULL"
+        cur.execute(
+            f"SELECT source, target, rel_type, evidence, source_hash FROM kg_edges {validity_clause}"
+        )
         adj: dict[str, list[tuple[str, str, str, str]]] = {}
         for row in cur.fetchall():
             s, t, rel, ev, sh = row[0], row[1], row[2] or "", row[3] or "", row[4] or ""

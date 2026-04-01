@@ -357,3 +357,90 @@ class TestAdaptiveHopLimit:
         result = graph.traverse("Boundary", max_hops=2)
         node_names = {n.name for n in result.nodes}
         assert any(n.startswith("Grand") for n in node_names)
+
+
+# ── Temporal Facts ────────────────────────────────────────────────────────────
+
+class TestTemporalFacts:
+    """Tests for valid_from/valid_until temporal columns on edges."""
+
+    def test_upsert_edge_stores_valid_from(self, graph):
+        graph.upsert_edge("A", "B", "WORKS_AT", 0.8, "ev", "h1", valid_from="2026-01-01")
+        edges = graph.get_all_edges()
+        assert edges[0]["valid_from"] == "2026-01-01"
+
+    def test_upsert_edge_default_valid_from_empty(self, graph):
+        graph.upsert_edge("A", "B", "KNOWS", 0.5, "", "h1")
+        edges = graph.get_all_edges()
+        assert edges[0]["valid_from"] == ""
+
+    def test_invalidate_edge_sets_valid_until(self, graph):
+        graph.upsert_edge("A", "B", "WORKS_AT", 0.8, "", "h1")
+        count = graph.invalidate_edge("2026-03-31", source="A", target="B")
+        assert count == 1
+        edges = graph.get_all_edges()
+        assert edges[0]["valid_until"] == "2026-03-31"
+
+    def test_invalidate_edge_by_source_target_rel(self, graph):
+        graph.upsert_edge("A", "B", "WORKS_AT", 0.8, "", "h1")
+        graph.upsert_edge("A", "B", "FRIENDS", 0.5, "", "h2")
+        count = graph.invalidate_edge("2026-03-31", source="A", target="B", rel_type="WORKS_AT")
+        assert count == 1
+        edges = graph.get_all_edges()
+        invalidated = [e for e in edges if e["valid_until"] is not None]
+        assert len(invalidated) == 1
+        assert invalidated[0]["relation"] == "WORKS_AT"
+
+    def test_invalidate_edge_no_match_returns_zero(self, graph):
+        graph.upsert_edge("A", "B", "KNOWS", 0.5, "", "h1")
+        count = graph.invalidate_edge("2026-03-31", source="X", target="Y")
+        assert count == 0
+
+    def test_traverse_excludes_invalidated(self, graph):
+        _add_node(graph, "A")
+        _add_node(graph, "B")
+        _add_node(graph, "C")
+        graph.upsert_edge("A", "B", "KNOWS", 0.8, "", "h1")
+        graph.upsert_edge("A", "C", "WORKS_AT", 0.7, "", "h2")
+        graph.invalidate_edge("2026-03-31", source="A", target="C")
+        result = graph.traverse("A", max_hops=2)
+        targets = {e.target for e in result.edges}
+        assert "B" in targets
+        assert "C" not in targets
+
+    def test_traverse_include_historical(self, graph):
+        _add_node(graph, "A")
+        _add_node(graph, "B")
+        graph.upsert_edge("A", "B", "WORKS_AT", 0.8, "", "h1")
+        graph.invalidate_edge("2026-03-31", source="A", target="B")
+        result = graph.traverse("A", max_hops=2, include_historical=True)
+        assert len(result.edges) == 1
+        assert result.edges[0].valid_until == "2026-03-31"
+
+    def test_find_path_excludes_invalidated(self, graph):
+        _add_node(graph, "A")
+        _add_node(graph, "B")
+        _add_node(graph, "C")
+        graph.upsert_edge("A", "B", "KNOWS", 0.8, "", "h1")
+        graph.upsert_edge("B", "C", "KNOWS", 0.7, "", "h2")
+        graph.invalidate_edge("2026-03-31", source="B", target="C")
+        result = graph.find_path("A", "C")
+        assert len(result.paths) == 0  # path broken by invalidation
+        result_hist = graph.find_path("A", "C", include_historical=True)
+        assert len(result_hist.paths) == 1
+
+    def test_get_all_edges_includes_validity(self, graph):
+        graph.upsert_edge("A", "B", "KNOWS", 0.5, "", "h1", valid_from="2026-01-01")
+        edges = graph.get_all_edges()
+        assert "valid_from" in edges[0]
+        assert "valid_until" in edges[0]
+        assert edges[0]["valid_from"] == "2026-01-01"
+        assert edges[0]["valid_until"] is None
+
+    def test_backward_compat_null_valid_until(self, graph):
+        """Edges with NULL valid_until are returned by default traverse."""
+        _add_node(graph, "A")
+        _add_node(graph, "B")
+        graph.upsert_edge("A", "B", "KNOWS", 0.8, "", "h1")
+        result = graph.traverse("A", max_hops=2)
+        assert len(result.edges) == 1  # NULL valid_until passes filter
