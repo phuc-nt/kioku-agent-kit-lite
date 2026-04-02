@@ -53,24 +53,28 @@ class TestGraphSearchBasic:
 class TestSelfEntityExclusion:
     def test_hub_excluded_when_other_seeds_present(self, graph):
         """When hub (highest mention_count) is passed alongside other entities,
-        hub is dropped from seeds and only the other entity is traversed."""
-        # Hub = "Phúc" with 10 mentions (clearly the top entity)
+        hub is dropped from seeds so Mẹ's direct neighbor scores highest.
+
+        With PPR (replaces BFS): Phúc is excluded from the teleport set so its
+        edges score lower than Mẹ's direct neighbors. h_me_sato must appear;
+        h_irr may appear but must score lower than h_me_sato (hub diluted).
+        """
         _add_node(graph, "Phúc", 10)
         _add_node(graph, "Mẹ", 3)
         _add_node(graph, "Sato", 1)
 
-        # Mẹ → Sato edge (should be found via Mẹ traversal)
         _add_edge(graph, "Mẹ", "Sato", "Mẹ gặp Sato", "h_me_sato")
-        # Phúc → IrrelevantNode (should NOT appear if Phúc is excluded)
         _add_node(graph, "IrrelevantNode", 1)
         _add_edge(graph, "Phúc", "IrrelevantNode", "unrelated memory", "h_irr")
 
-        # Search with both Mẹ and Phúc; Phúc should be excluded
         results = graph_search(graph, "mẹ tình cảm", entities=["Mẹ", "Phúc"])
         hashes = {r.content_hash for r in results}
 
         assert "h_me_sato" in hashes, "Mẹ→Sato edge should be in results"
-        assert "h_irr" not in hashes, "Phúc→IrrelevantNode should be excluded (hub filtered)"
+        # PPR: h_me_sato must score higher than h_irr (seed=Mẹ, Phúc is excluded from teleport)
+        scores = {r.content_hash: r.score for r in results}
+        if "h_irr" in scores:
+            assert scores["h_me_sato"] >= scores["h_irr"], "Mẹ's direct neighbor must score >= hub's edge"
 
     def test_hub_kept_when_it_is_the_only_seed(self, graph):
         """Fallback: if hub is the only entity passed, keep it (don't return empty)."""
@@ -90,7 +94,12 @@ class TestSelfEntityExclusion:
         assert graph.get_top_entity() == "HubPerson"
 
     def test_exclusion_uses_case_insensitive_match(self, graph):
-        """Hub exclusion should be case-insensitive."""
+        """Hub exclusion should be case-insensitive.
+
+        With PPR: 'phúc' (lowercase) should still be recognized as the hub and
+        excluded from the teleport set. Mẹ's direct edge h_mb must appear and
+        score higher than the hub's edge h_noise.
+        """
         _add_node(graph, "Phúc", 10)  # stored as "Phúc"
         _add_node(graph, "Mẹ", 3)
         _add_node(graph, "Bạn bè", 1)
@@ -101,15 +110,22 @@ class TestSelfEntityExclusion:
         # Pass "phúc" (lowercase) — should still be recognized as hub
         results = graph_search(graph, "mẹ", entities=["Mẹ", "phúc"])
         hashes = {r.content_hash for r in results}
-        assert "h_noise" not in hashes
+        assert "h_mb" in hashes, "Mẹ's direct neighbor should be in results"
+        # h_mb must score at least as high as h_noise (Phúc excluded from seeds)
+        scores = {r.content_hash: r.score for r in results}
+        if "h_noise" in scores:
+            assert scores["h_mb"] >= scores["h_noise"], "Mẹ edge must score >= hub's edge"
 
 
 # ── Task 2E: multi-entity intersection ────────────────────────────────────────
 
 class TestMultiEntityIntersection:
     def test_intersection_keeps_only_common_memories(self, graph):
-        """With 2 entities, only memories reachable from BOTH should be returned.
-        A clear hub ('User') is added so neither A nor B is the top entity (auto-excluded by 1A).
+        """PPR replaces strict intersection: shared memory scores highest.
+
+        With PPR + multi-seed teleport: h_common receives score from BOTH A and B
+        seeds, so it must rank first. Single-entity memories may also appear but
+        must score lower than the shared memory.
         """
         # Hub entity — will be auto-excluded by Task 1A
         _add_node(graph, "User", 10)
@@ -132,10 +148,10 @@ class TestMultiEntityIntersection:
         results = graph_search(graph, "test", entities=["A", "B"])
         hashes = {r.content_hash for r in results}
 
-        assert "h_common" in hashes, "Shared memory must be in intersection results"
-        assert "h1" not in hashes, "A-only memory must be excluded"
-        assert "h2" not in hashes, "A-only memory must be excluded"
-        assert "h4" not in hashes, "B-only memory must be excluded"
+        assert "h_common" in hashes, "Shared memory must be in PPR results"
+        # h_common should rank at or near the top (highest score)
+        top_result = results[0]
+        assert top_result.content_hash == "h_common", "Shared memory should be ranked first by PPR"
 
     def test_intersection_fallback_to_union_when_no_common(self, graph):
         """When no memory is reachable from ALL seeds, fall back to union.
@@ -170,7 +186,11 @@ class TestMultiEntityIntersection:
         assert len(hashes) == 3, "All 3 memories should be returned for single entity"
 
     def test_three_entity_intersection(self, graph):
-        """3 entities → only memories reachable from ALL THREE."""
+        """PPR with 3 seeds: the shared memory scores highest.
+
+        h_all receives teleport pressure from all 3 seeds → ranked first.
+        h_12 connected to only E1+E2 may appear but must score lower than h_all.
+        """
         for name in ["E1", "E2", "E3"]:
             _add_node(graph, name, 2)
 
@@ -180,7 +200,7 @@ class TestMultiEntityIntersection:
         _add_edge(graph, "E2", "Common", "all three meet here", "h_all")
         _add_edge(graph, "E3", "Common", "all three meet here", "h_all")
 
-        # Exclusive memories
+        # Exclusive memories — connected to only E1 and E2
         _add_node(graph, "Only12", 1)
         _add_edge(graph, "E1", "Only12", "only E1 and E2", "h_12")
         _add_edge(graph, "E2", "Only12", "only E1 and E2", "h_12")
@@ -188,8 +208,11 @@ class TestMultiEntityIntersection:
         results = graph_search(graph, "test", entities=["E1", "E2", "E3"])
         hashes = {r.content_hash for r in results}
 
-        assert "h_all" in hashes, "Memory reachable from all 3 should be in results"
-        assert "h_12" not in hashes, "Memory only reachable from E1+E2 (not E3) should be excluded"
+        assert "h_all" in hashes, "Memory reachable from all 3 should be in PPR results"
+        # h_all should rank above h_12 since it receives score from all 3 seeds
+        scores = {r.content_hash: r.score for r in results}
+        if "h_12" in scores:
+            assert scores["h_all"] >= scores["h_12"], "Triple-seed memory must score >= dual-seed memory"
 
     def test_intersection_not_applied_without_explicit_entities(self, graph):
         """Token-based fallback (no entities param) should still return results."""
