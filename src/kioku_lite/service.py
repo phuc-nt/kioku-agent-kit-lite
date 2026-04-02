@@ -498,6 +498,46 @@ class KiokuLiteService:
                 return f"{y}-01-01", f"{y}-12-31"
         return None, None
 
+    # ── consolidate ────────────────────────────────────────────────────────────
+
+    def consolidate(
+        self,
+        half_life_days: int = 90,
+        older_than_days: int = 30,
+        auto_merge: bool = False,
+    ) -> dict:
+        """Run all consolidation steps. Returns report for agent to act on.
+
+        Steps:
+          1. Apply confidence decay to KG edges
+          2. Scan for near-duplicate entities (reuse dedup engine)
+          3. Surface stale memories older than `older_than_days`
+        """
+        from kioku_lite.pipeline.consolidation import (
+            build_decay_report,
+            build_stale_report,
+            stale_cutoff,
+        )
+
+        # Step 1: confidence decay
+        decayed = self.db.graph.apply_confidence_decay(half_life_days=half_life_days)
+
+        # Step 2: dedup scan
+        dedup_result = self.dedup_scan(auto_merge=auto_merge)
+
+        # Step 3: stale memories
+        cutoff = stale_cutoff(older_than_days)
+        stale = self.db.memory.get_timeline(end_date=cutoff.isoformat(), limit=50)
+
+        return {
+            "decay": build_decay_report(decayed, half_life_days),
+            "merge_suggestions": {
+                "candidates": dedup_result.get("candidates", []),
+                "auto_merged": dedup_result.get("auto_merged", []),
+            },
+            "stale_memories": build_stale_report(stale, cutoff),
+        }
+
     # ── export ─────────────────────────────────────────────────────────────────
 
     def get_graph_data(self) -> dict:

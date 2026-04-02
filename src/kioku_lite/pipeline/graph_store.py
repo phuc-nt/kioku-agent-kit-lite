@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections import deque
+from datetime import date as _date, datetime, timezone
 
 from kioku_lite.pipeline.models import GraphEdge, GraphNode, GraphSearchResult
 
@@ -61,21 +62,25 @@ class GraphStore:
         """Insert or update relationship edge, averaging weights on conflict.
 
         ON CONFLICT does NOT touch valid_from/valid_until — re-indexing same
-        fact should not un-invalidate it.
+        fact should not un-invalidate it. last_reinforced is always refreshed.
         """
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         cur = self.conn.cursor()
         cur.execute(
             """
             INSERT INTO kg_edges
-                (source, target, rel_type, weight, evidence, source_hash, event_time, valid_from)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (source, target, rel_type, weight, evidence, source_hash,
+                 event_time, valid_from, last_reinforced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source, target, rel_type) DO UPDATE SET
                 weight = (weight + excluded.weight) / 2,
                 evidence = excluded.evidence,
                 source_hash = excluded.source_hash,
-                event_time = excluded.event_time
+                event_time = excluded.event_time,
+                last_reinforced = excluded.last_reinforced
             """,
-            (source, target, rel_type, weight, evidence, source_hash, event_time, valid_from),
+            (source, target, rel_type, weight, evidence, source_hash,
+             event_time, valid_from, today),
         )
         self.conn.commit()
 
@@ -303,7 +308,7 @@ class GraphStore:
             cur.execute(
                 f"""
                 SELECT source, target, rel_type, weight, evidence, source_hash,
-                       valid_from, valid_until
+                       valid_from, valid_until, last_reinforced
                 FROM kg_edges
                 WHERE (source = ? COLLATE NOCASE OR target = ? COLLATE NOCASE)
                     {validity_clause}
@@ -312,14 +317,14 @@ class GraphStore:
                 (current, current),
             )
             for row in cur.fetchall():
-                src, tgt, rel, weight, evidence, src_hash, vf, vu = row
+                src, tgt, rel, weight, evidence, src_hash, vf, vu, lr = row
                 key = f"{src.lower()}|{tgt.lower()}|{rel}|{src_hash}"
                 if key not in seen:
                     seen.add(key)
                     edges.append(GraphEdge(
                         source=src, target=tgt, rel_type=rel,
                         weight=weight, evidence=evidence or "", source_hash=src_hash or "",
-                        valid_from=vf or "", valid_until=vu,
+                        valid_from=vf or "", valid_until=vu, last_reinforced=lr or "",
                     ))
                     nodes_map[src.lower()] = GraphNode(name=src, type="")
                     nodes_map[tgt.lower()] = GraphNode(name=tgt, type="")
@@ -495,7 +500,7 @@ class GraphStore:
         cur.execute(
             """
             SELECT source, target, rel_type, weight, evidence, event_time,
-                   valid_from, valid_until
+                   valid_from, valid_until, last_reinforced
             FROM kg_edges
             ORDER BY weight DESC
             """
@@ -510,9 +515,68 @@ class GraphStore:
                 "event_time": r[5] or "",
                 "valid_from": r[6] or "",
                 "valid_until": r[7],
+                "last_reinforced": r[8] or "",
             }
             for r in cur.fetchall()
         ]
+
+    def apply_confidence_decay(
+        self,
+        half_life_days: int = 90,
+        min_weight: float = 0.1,
+        reference_date: str = "",
+    ) -> list[dict]:
+        """Apply exponential decay to edge weights based on time since last reinforcement.
+
+        Formula: new_weight = weight * 0.5 ^ (days_since / half_life_days)
+        Edges with last_reinforced = '' (legacy) are skipped.
+        Returns list of edges that were updated, with old/new weights.
+        """
+        if half_life_days <= 0:
+            return []
+
+        ref = _date.fromisoformat(reference_date) if reference_date else datetime.now(timezone.utc).date()
+        ref_str = ref.isoformat()
+
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT id, source, target, rel_type, weight, last_reinforced
+            FROM kg_edges
+            WHERE last_reinforced != '' AND last_reinforced < ?
+            """,
+            (ref_str,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return []
+
+        updated: list[dict] = []
+        for row in rows:
+            edge_id, source, target, rel_type, weight, lr = row
+            try:
+                lr_date = _date.fromisoformat(lr)
+            except ValueError:
+                continue  # malformed date — skip
+            days_since = (ref - lr_date).days
+            if days_since <= 0:
+                continue
+            new_weight = weight * (0.5 ** (days_since / half_life_days))
+            new_weight = max(new_weight, min_weight)
+            cur.execute("UPDATE kg_edges SET weight = ? WHERE id = ?", (new_weight, edge_id))
+            updated.append({
+                "source": source,
+                "target": target,
+                "rel_type": rel_type,
+                "old_weight": round(weight, 6),
+                "new_weight": round(new_weight, 6),
+                "days_since_reinforced": days_since,
+                "last_reinforced": lr,
+            })
+
+        if updated:
+            self.conn.commit()
+        return updated
 
     def find_path(
         self, source: str, target: str, include_historical: bool = False,

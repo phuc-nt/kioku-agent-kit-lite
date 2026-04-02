@@ -545,6 +545,38 @@ def install_profile(
     typer.echo("")
 
 
+# ── consolidate ───────────────────────────────────────────────────────────────
+
+@app.command()
+def consolidate(
+    half_life: int = typer.Option(90, "--half-life", help="Decay half-life in days."),
+    older_than: int = typer.Option(30, "--older-than", help="Surface memories older than N days."),
+    auto_merge: bool = typer.Option(False, "--auto-merge", help="Auto-merge qualifying duplicate pairs."),
+) -> None:
+    """Consolidate knowledge graph: decay stale edges, find duplicates, surface old memories.
+
+    Agent-driven: this command surfaces data for the agent to act on.
+
+    \b
+    Output sections:
+      decay           — edges whose weights were reduced (agent can reinforce or invalidate)
+      merge_suggestions — duplicate entity pairs (agent can approve or reject)
+      stale_memories  — old memories (agent can summarize into weekly/monthly entries)
+
+    \b
+    Examples:
+      kioku-lite consolidate
+      kioku-lite consolidate --half-life 30
+      kioku-lite consolidate --older-than 60 --auto-merge
+    """
+    result = _get_svc().consolidate(
+        half_life_days=half_life,
+        older_than_days=older_than,
+        auto_merge=auto_merge,
+    )
+    _out(result)
+
+
 @app.command(name="export-graph")
 def export_graph(
     output: Optional[str] = typer.Argument(

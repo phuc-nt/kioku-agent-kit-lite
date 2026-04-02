@@ -44,6 +44,7 @@ class GraphEdge:
     source_hash: str = ""   # links back to SQLite memories for hydration
     valid_from: str = ""           # when fact became true ('' = unknown)
     valid_until: str | None = None  # when fact stopped being true (None = current)
+    last_reinforced: str = ""      # when edge was last re-confirmed ('' = legacy/unknown)
 
 
 @dataclass

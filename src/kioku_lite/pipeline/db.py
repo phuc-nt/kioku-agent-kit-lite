@@ -153,7 +153,7 @@ class KiokuDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_edges_tgt ON kg_edges(target COLLATE NOCASE)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_edges_valid ON kg_edges(valid_until)")
         # Migrations for older DBs
-        for col, default in [("valid_from", "''"), ("valid_until", "NULL")]:
+        for col, default in [("valid_from", "''"), ("valid_until", "NULL"), ("last_reinforced", "''")]:
             try:
                 cur.execute(f"ALTER TABLE kg_edges ADD COLUMN {col} TEXT DEFAULT {default}")
             except sqlite3.OperationalError:
