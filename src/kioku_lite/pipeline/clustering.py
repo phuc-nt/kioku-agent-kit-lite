@@ -34,14 +34,14 @@ class Community:
 
 
 def _build_adjacency(conn: sqlite3.Connection, include_historical: bool) -> dict[str, set[str]]:
-    """Load edges from DB and build an undirected adjacency list."""
+    """Load edges from DB and build an undirected adjacency list (lowercased keys)."""
     cur = conn.cursor()
     validity_clause = "" if include_historical else "WHERE valid_until IS NULL"
     cur.execute(f"SELECT source, target FROM kg_edges {validity_clause}")
     adj: dict[str, set[str]] = {}
     for src, tgt in cur.fetchall():
-        adj.setdefault(src, set()).add(tgt)
-        adj.setdefault(tgt, set()).add(src)
+        adj.setdefault(src.lower(), set()).add(tgt)
+        adj.setdefault(tgt.lower(), set()).add(src)
     return adj
 
 
@@ -60,7 +60,7 @@ def _bfs_component(start: str, adj: dict[str, set[str]], visited: set[str]) -> l
     while queue:
         node = queue.popleft()
         component.append(node)
-        for neighbor in adj.get(node, set()):
+        for neighbor in adj.get(node.lower(), set()):
             if neighbor.lower() not in visited:
                 visited.add(neighbor.lower())
                 queue.append(neighbor)
@@ -100,8 +100,8 @@ def find_communities(
 
     # Ensure isolated nodes (no edges) are included
     for name in all_node_names:
-        if name not in adj:
-            adj[name] = set()
+        if name.lower() not in adj:
+            adj[name.lower()] = set()
 
     visited: set[str] = set()
     communities: list[Community] = []
@@ -119,7 +119,7 @@ def find_communities(
         edge_count = sum(
             1
             for n in component
-            for neighbor in adj.get(n, set())
+            for neighbor in adj.get(n.lower(), set())
             if neighbor.lower() in member_set and neighbor.lower() > n.lower()
         )
 

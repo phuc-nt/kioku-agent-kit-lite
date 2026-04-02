@@ -25,6 +25,7 @@ def personalized_pagerank(
     """
     if not seeds:
         return {}
+    damping = max(0.01, min(0.99, damping))  # clamp to valid range
 
     validity_clause = "" if include_historical else "AND valid_until IS NULL"
     cur = conn.cursor()

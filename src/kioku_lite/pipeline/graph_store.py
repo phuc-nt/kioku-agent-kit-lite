@@ -91,18 +91,22 @@ class GraphStore:
         target: str | None = None,
         rel_type: str | None = None,
     ) -> int:
-        """Mark edge(s) as no longer valid. Returns count of rows updated."""
+        """Mark edge(s) as no longer valid. Returns count of rows updated.
+
+        At least one of source/target must be a non-empty string.
+        Empty strings are treated as None (not as wildcards).
+        """
         clauses: list[str] = []
         params: list[str] = [valid_until]  # SET valid_until = ? comes first
-        if source:
+        if source and source.strip():
             clauses.append("source = ? COLLATE NOCASE")
-            params.append(source)
-        if target:
+            params.append(source.strip())
+        if target and target.strip():
             clauses.append("target = ? COLLATE NOCASE")
-            params.append(target)
-        if rel_type:
+            params.append(target.strip())
+        if rel_type and rel_type.strip():
             clauses.append("rel_type = ? COLLATE NOCASE")
-            params.append(rel_type)
+            params.append(rel_type.strip())
         if not clauses:
             return 0
         sql = f"UPDATE kg_edges SET valid_until = ? WHERE {' AND '.join(clauses)}"
@@ -401,28 +405,42 @@ class GraphStore:
 
         cur.execute("SAVEPOINT merge_entity")
         try:
-            # Re-point edges where source is the source
+            # Save IDs of target's pre-existing self-loops (preserve them)
+            cur.execute(
+                "SELECT id FROM kg_edges WHERE source = ? COLLATE NOCASE AND target = ? COLLATE NOCASE",
+                (target, target),
+            )
+            pre_existing_self_loop_ids = {row[0] for row in cur.fetchall()}
+
+            # Re-point edges where source entity is the edge source
             cur.execute(
                 "UPDATE kg_edges SET source = ? WHERE source = ? COLLATE NOCASE",
                 (target, source),
             )
-            # Re-point edges where source is the target
+            # Re-point edges where source entity is the edge target
             cur.execute(
                 "UPDATE kg_edges SET target = ? WHERE target = ? COLLATE NOCASE",
                 (target, source),
             )
-            # Remove self-loops created by re-pointing (source->source becomes target->target)
+            # Remove only merge-created self-loops (not pre-existing ones)
             cur.execute(
-                "DELETE FROM kg_edges WHERE source = ? AND target = ? COLLATE NOCASE",
+                "SELECT id FROM kg_edges WHERE source = ? COLLATE NOCASE AND target = ? COLLATE NOCASE",
                 (target, target),
             )
+            all_self_loop_ids = {row[0] for row in cur.fetchall()}
+            new_self_loops = all_self_loop_ids - pre_existing_self_loop_ids
+            if new_self_loops:
+                placeholders = ",".join("?" * len(new_self_loops))
+                cur.execute(f"DELETE FROM kg_edges WHERE id IN ({placeholders})", list(new_self_loops))
             # Dedup edges: keep lowest id per (source, target, rel_type)
+            # Scoped to only the target entity's edges (not global)
             cur.execute(
                 """
                 DELETE FROM kg_edges WHERE id NOT IN (
                     SELECT MIN(id) FROM kg_edges GROUP BY source, target, rel_type
-                )
-                """
+                ) AND (source = ? COLLATE NOCASE OR target = ? COLLATE NOCASE)
+                """,
+                (target, target),
             )
             # Accumulate mention_count into target
             cur.execute(
@@ -595,6 +613,7 @@ class GraphStore:
             SELECT id, source, target, rel_type, weight, last_reinforced
             FROM kg_edges
             WHERE last_reinforced != '' AND last_reinforced < ?
+                AND valid_until IS NULL
             """,
             (ref_str,),
         )
