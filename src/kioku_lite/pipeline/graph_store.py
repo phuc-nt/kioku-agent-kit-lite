@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import sqlite3
 from collections import deque
+from datetime import date as _date, datetime, timezone
 
 from kioku_lite.pipeline.models import GraphEdge, GraphNode, GraphSearchResult
 
@@ -26,19 +27,24 @@ class GraphStore:
 
     # ── Upsert ─────────────────────────────────────────────────────────────────
 
-    def upsert_node(self, name: str, entity_type: str, date: str) -> None:
-        """Insert or update entity node, incrementing mention_count."""
+    def upsert_node(self, name: str, entity_type: str, date: str, confidence: float = 1.0) -> None:
+        """Insert or update entity node, incrementing mention_count.
+
+        Confidence uses MAX strategy: re-upserting with a higher value raises it,
+        but never lowers it.
+        """
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO kg_nodes (name, type, mention_count, first_seen, last_seen)
-            VALUES (?, ?, 1, ?, ?)
+            INSERT INTO kg_nodes (name, type, mention_count, first_seen, last_seen, confidence)
+            VALUES (?, ?, 1, ?, ?, ?)
             ON CONFLICT(name) DO UPDATE SET
                 mention_count = mention_count + 1,
                 last_seen = excluded.last_seen,
-                type = CASE WHEN excluded.type != '' THEN excluded.type ELSE type END
+                type = CASE WHEN excluded.type != '' THEN excluded.type ELSE type END,
+                confidence = MAX(confidence, excluded.confidence)
             """,
-            (name, entity_type, date, date),
+            (name, entity_type, date, date, confidence),
         )
         self.conn.commit()
 
@@ -51,22 +57,63 @@ class GraphStore:
         evidence: str,
         source_hash: str,
         event_time: str = "",
+        valid_from: str = "",
     ) -> None:
-        """Insert or update relationship edge, averaging weights on conflict."""
+        """Insert or update relationship edge, averaging weights on conflict.
+
+        ON CONFLICT does NOT touch valid_from/valid_until — re-indexing same
+        fact should not un-invalidate it. last_reinforced is always refreshed.
+        """
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         cur = self.conn.cursor()
         cur.execute(
             """
-            INSERT INTO kg_edges (source, target, rel_type, weight, evidence, source_hash, event_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO kg_edges
+                (source, target, rel_type, weight, evidence, source_hash,
+                 event_time, valid_from, last_reinforced)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(source, target, rel_type) DO UPDATE SET
                 weight = (weight + excluded.weight) / 2,
                 evidence = excluded.evidence,
                 source_hash = excluded.source_hash,
-                event_time = excluded.event_time
+                event_time = excluded.event_time,
+                last_reinforced = excluded.last_reinforced
             """,
-            (source, target, rel_type, weight, evidence, source_hash, event_time),
+            (source, target, rel_type, weight, evidence, source_hash,
+             event_time, valid_from, today),
         )
         self.conn.commit()
+
+    def invalidate_edge(
+        self,
+        valid_until: str,
+        source: str | None = None,
+        target: str | None = None,
+        rel_type: str | None = None,
+    ) -> int:
+        """Mark edge(s) as no longer valid. Returns count of rows updated.
+
+        At least one of source/target must be a non-empty string.
+        Empty strings are treated as None (not as wildcards).
+        """
+        clauses: list[str] = []
+        params: list[str] = [valid_until]  # SET valid_until = ? comes first
+        if source and source.strip():
+            clauses.append("source = ? COLLATE NOCASE")
+            params.append(source.strip())
+        if target and target.strip():
+            clauses.append("target = ? COLLATE NOCASE")
+            params.append(target.strip())
+        if rel_type and rel_type.strip():
+            clauses.append("rel_type = ? COLLATE NOCASE")
+            params.append(rel_type.strip())
+        if not clauses:
+            return 0
+        sql = f"UPDATE kg_edges SET valid_until = ? WHERE {' AND '.join(clauses)}"
+        cur = self.conn.cursor()
+        cur.execute(sql, params)
+        self.conn.commit()
+        return cur.rowcount
 
     def add_alias(self, alias: str, canonical: str) -> None:
         """Register an alias → canonical SAME_AS mapping. Skips if alias == canonical."""
@@ -94,7 +141,7 @@ class GraphStore:
         cur = self.conn.cursor()
         cur.execute(
             """
-            SELECT n.name, n.type, n.mention_count,
+            SELECT n.name, n.type, n.mention_count, n.confidence,
                    GROUP_CONCAT(a.alias, '|||') AS aliases
             FROM kg_nodes n
             LEFT JOIN kg_aliases a ON a.canonical = n.name COLLATE NOCASE
@@ -109,28 +156,45 @@ class GraphStore:
                 "name": r[0],
                 "type": r[1] or "",
                 "mentions": r[2] or 0,
-                "aliases": [x for x in (r[3] or "").split("|||") if x],
+                "confidence": r[3] if r[3] is not None else 1.0,
+                "aliases": [x for x in (r[4] or "").split("|||") if x],
             }
             for r in cur.fetchall()
         ]
 
-    def search_nodes(self, query: str, limit: int = 30) -> list[GraphNode]:
-        """Case-insensitive substring search, re-ranked by match quality."""
+    def search_nodes(self, query: str, limit: int = 30, min_confidence: float = 0.0) -> list[GraphNode]:
+        """Case-insensitive substring search, re-ranked by match quality.
+
+        min_confidence: if > 0, excludes nodes with confidence below threshold.
+        """
         cur = self.conn.cursor()
-        cur.execute(
-            """
-            SELECT name, type, mention_count, first_seen, last_seen
-            FROM kg_nodes
-            WHERE name LIKE ? COLLATE NOCASE
-            ORDER BY mention_count DESC
-            LIMIT ?
-            """,
-            (f"%{query}%", limit),
-        )
+        if min_confidence > 0.0:
+            cur.execute(
+                """
+                SELECT name, type, mention_count, first_seen, last_seen, confidence
+                FROM kg_nodes
+                WHERE name LIKE ? COLLATE NOCASE AND confidence >= ?
+                ORDER BY mention_count DESC
+                LIMIT ?
+                """,
+                (f"%{query}%", min_confidence, limit),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT name, type, mention_count, first_seen, last_seen, confidence
+                FROM kg_nodes
+                WHERE name LIKE ? COLLATE NOCASE
+                ORDER BY mention_count DESC
+                LIMIT ?
+                """,
+                (f"%{query}%", limit),
+            )
         nodes = [
             GraphNode(
                 name=r[0], type=r[1] or "", mention_count=r[2] or 0,
                 first_seen=r[3] or "", last_seen=r[4] or "",
+                confidence=r[5] if r[5] is not None else 1.0,
             )
             for r in cur.fetchall()
         ]
@@ -177,11 +241,18 @@ class GraphStore:
         row = cur.fetchone()
         return row[0] if row else 0
 
-    def traverse(self, entity_name: str, max_hops: int = 2, limit: int = 20) -> GraphSearchResult:
+    def traverse(
+        self,
+        entity_name: str,
+        max_hops: int = 2,
+        limit: int = 20,
+        include_historical: bool = False,
+    ) -> GraphSearchResult:
         """BFS traversal from seed entity, following SAME_AS aliases.
 
         Uses adaptive hop limit (Task 1C): hub nodes with degree > 15 are
         capped at 1 hop to avoid returning the majority of the DB.
+        By default only follows currently-valid edges (valid_until IS NULL).
         """
         seeds = self._resolve_names(entity_name)
 
@@ -194,7 +265,7 @@ class GraphStore:
         seen: set[str] = set()
 
         for seed in seeds:
-            self._bfs(seed, effective_hops, limit, nodes_map, edges, seen)
+            self._bfs(seed, effective_hops, limit, nodes_map, edges, seen, include_historical)
 
         return GraphSearchResult(nodes=list(nodes_map.values()), edges=edges[:limit])
 
@@ -222,33 +293,42 @@ class GraphStore:
         nodes_map: dict[str, GraphNode],
         edges: list[GraphEdge],
         seen: set[str],
+        include_historical: bool = False,
     ) -> None:
-        """BFS from start, collecting up to `limit` edges."""
+        """BFS from start, collecting up to `limit` edges.
+
+        By default only traverses valid edges (valid_until IS NULL).
+        """
         queue: deque[tuple[str, int]] = deque([(start, 0)])
         visited: set[str] = {start.lower()}
         cur = self.conn.cursor()
+
+        validity_clause = "" if include_historical else "AND valid_until IS NULL"
 
         while queue and len(edges) < limit:
             current, depth = queue.popleft()
             if depth >= max_hops:
                 continue
             cur.execute(
-                """
-                SELECT source, target, rel_type, weight, evidence, source_hash
+                f"""
+                SELECT source, target, rel_type, weight, evidence, source_hash,
+                       valid_from, valid_until, last_reinforced
                 FROM kg_edges
-                WHERE source = ? COLLATE NOCASE OR target = ? COLLATE NOCASE
+                WHERE (source = ? COLLATE NOCASE OR target = ? COLLATE NOCASE)
+                    {validity_clause}
                 ORDER BY weight DESC LIMIT 50
                 """,
                 (current, current),
             )
             for row in cur.fetchall():
-                src, tgt, rel, weight, evidence, src_hash = row
+                src, tgt, rel, weight, evidence, src_hash, vf, vu, lr = row
                 key = f"{src.lower()}|{tgt.lower()}|{rel}|{src_hash}"
                 if key not in seen:
                     seen.add(key)
                     edges.append(GraphEdge(
                         source=src, target=tgt, rel_type=rel,
                         weight=weight, evidence=evidence or "", source_hash=src_hash or "",
+                        valid_from=vf or "", valid_until=vu, last_reinforced=lr or "",
                     ))
                     nodes_map[src.lower()] = GraphNode(name=src, type="")
                     nodes_map[tgt.lower()] = GraphNode(name=tgt, type="")
@@ -261,11 +341,11 @@ class GraphStore:
         self._enrich_nodes(nodes_map)
 
     def _enrich_nodes(self, nodes_map: dict[str, GraphNode]) -> None:
-        """Fill in type/mention_count/dates for collected nodes."""
+        """Fill in type/mention_count/dates/confidence for collected nodes."""
         cur = self.conn.cursor()
         for key, node in list(nodes_map.items()):
             cur.execute(
-                "SELECT name, type, mention_count, first_seen, last_seen "
+                "SELECT name, type, mention_count, first_seen, last_seen, confidence "
                 "FROM kg_nodes WHERE name = ? COLLATE NOCASE",
                 (node.name,),
             )
@@ -274,7 +354,185 @@ class GraphStore:
                 nodes_map[key] = GraphNode(
                     name=row[0], type=row[1] or "", mention_count=row[2] or 0,
                     first_seen=row[3] or "", last_seen=row[4] or "",
+                    confidence=row[5] if row[5] is not None else 1.0,
                 )
+
+    # ── Merge ──────────────────────────────────────────────────────────────────
+
+    def merge_entities(
+        self,
+        source: str,
+        target: str,
+        merge_type: str = "auto",
+        vector_sim: float = 0.0,
+        name_sim: float = 0.0,
+    ) -> dict:
+        """Atomically merge source entity into target.
+
+        - Re-points all edges from source to target
+        - Deduplicates edges after re-pointing (keep lowest id per src+tgt+rel_type)
+        - Accumulates mention_count from source into target
+        - Registers source as alias of target
+        - Logs merge to kg_merge_log
+        - Deletes source node
+
+        Returns status dict. No-ops if source == target (case-insensitive) or
+        source does not exist.
+        """
+        if source.strip().lower() == target.strip().lower():
+            return {"status": "skipped", "reason": "self-merge"}
+
+        cur = self.conn.cursor()
+        cur.execute(
+            "SELECT mention_count FROM kg_nodes WHERE name = ? COLLATE NOCASE",
+            (source,),
+        )
+        src_row = cur.fetchone()
+        if not src_row:
+            return {"status": "skipped", "reason": "source not found"}
+
+        cur.execute(
+            "SELECT name FROM kg_nodes WHERE name = ? COLLATE NOCASE",
+            (target,),
+        )
+        if not cur.fetchone():
+            return {"status": "skipped", "reason": "target not found"}
+
+        src_mentions = src_row[0] or 0
+
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+        cur.execute("SAVEPOINT merge_entity")
+        try:
+            # Save IDs of target's pre-existing self-loops (preserve them)
+            cur.execute(
+                "SELECT id FROM kg_edges WHERE source = ? COLLATE NOCASE AND target = ? COLLATE NOCASE",
+                (target, target),
+            )
+            pre_existing_self_loop_ids = {row[0] for row in cur.fetchall()}
+
+            # Re-point edges where source entity is the edge source
+            cur.execute(
+                "UPDATE kg_edges SET source = ? WHERE source = ? COLLATE NOCASE",
+                (target, source),
+            )
+            # Re-point edges where source entity is the edge target
+            cur.execute(
+                "UPDATE kg_edges SET target = ? WHERE target = ? COLLATE NOCASE",
+                (target, source),
+            )
+            # Remove only merge-created self-loops (not pre-existing ones)
+            cur.execute(
+                "SELECT id FROM kg_edges WHERE source = ? COLLATE NOCASE AND target = ? COLLATE NOCASE",
+                (target, target),
+            )
+            all_self_loop_ids = {row[0] for row in cur.fetchall()}
+            new_self_loops = all_self_loop_ids - pre_existing_self_loop_ids
+            if new_self_loops:
+                placeholders = ",".join("?" * len(new_self_loops))
+                cur.execute(f"DELETE FROM kg_edges WHERE id IN ({placeholders})", list(new_self_loops))
+            # Dedup edges: keep lowest id per (source, target, rel_type)
+            # Scoped to only the target entity's edges (not global)
+            cur.execute(
+                """
+                DELETE FROM kg_edges WHERE id NOT IN (
+                    SELECT MIN(id) FROM kg_edges GROUP BY source, target, rel_type
+                ) AND (source = ? COLLATE NOCASE OR target = ? COLLATE NOCASE)
+                """,
+                (target, target),
+            )
+            # Accumulate mention_count into target
+            cur.execute(
+                "UPDATE kg_nodes SET mention_count = mention_count + ? WHERE name = ? COLLATE NOCASE",
+                (src_mentions, target),
+            )
+            # Register source as alias of target (reuse existing method logic inline
+            # to avoid commit inside SAVEPOINT)
+            cur.execute(
+                "INSERT OR IGNORE INTO kg_aliases (alias, canonical) VALUES (?, ?)",
+                (source, target),
+            )
+            cur.execute(
+                "UPDATE kg_nodes SET is_canonical = 1 WHERE name = ? COLLATE NOCASE",
+                (target,),
+            )
+            # Log merge
+            cur.execute(
+                """
+                INSERT INTO kg_merge_log
+                    (source_name, target_name, merge_type, vector_sim, name_sim, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (source, target, merge_type, vector_sim, name_sim, ts),
+            )
+            # Delete source node
+            cur.execute(
+                "DELETE FROM kg_nodes WHERE name = ? COLLATE NOCASE",
+                (source,),
+            )
+            cur.execute("RELEASE merge_entity")
+            self.conn.commit()
+        except Exception:
+            cur.execute("ROLLBACK TO merge_entity")
+            cur.execute("RELEASE merge_entity")
+            raise
+
+        log.info("Merged '%s' → '%s' (%s, vec=%.3f, name=%.3f)",
+                 source, target, merge_type, vector_sim, name_sim)
+        return {"status": "merged", "source": source, "target": target,
+                "merge_type": merge_type, "vector_sim": vector_sim, "name_sim": name_sim}
+
+    # ── Clusters ───────────────────────────────────────────────────────────────
+
+    def save_clusters(self, clusters) -> None:
+        """Persist communities to kg_clusters (clear-and-reinsert).
+
+        clusters: list[Community] from kioku_lite.pipeline.clustering
+        """
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM kg_clusters")
+        for cluster in clusters:
+            for entity in cluster.entities:
+                cur.execute(
+                    "INSERT OR IGNORE INTO kg_clusters (cluster_id, label, entity_name) VALUES (?, ?, ?)",
+                    (cluster.id, cluster.label, entity),
+                )
+        self.conn.commit()
+
+    def get_clusters(self) -> list[dict]:
+        """Return all clusters with entity counts, grouped by cluster_id."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT cluster_id, label, COUNT(*) as entity_count
+            FROM kg_clusters
+            GROUP BY cluster_id, label
+            ORDER BY entity_count DESC
+            """
+        )
+        return [
+            {"cluster_id": r[0], "label": r[1], "entity_count": r[2]}
+            for r in cur.fetchall()
+        ]
+
+    def get_cluster_entities(self, cluster_label: str) -> list[str]:
+        """Return all entity names belonging to the first cluster matching label."""
+        cur = self.conn.cursor()
+        # Find the cluster_id for the given label
+        cur.execute(
+            "SELECT cluster_id FROM kg_clusters WHERE label = ? COLLATE NOCASE LIMIT 1",
+            (cluster_label,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return []
+        cluster_id = row[0]
+        cur.execute(
+            "SELECT entity_name FROM kg_clusters WHERE cluster_id = ?",
+            (cluster_id,),
+        )
+        return [r[0] for r in cur.fetchall()]
 
     # ── Export ─────────────────────────────────────────────────────────────────
 
@@ -284,7 +542,7 @@ class GraphStore:
         cur.execute(
             """
             SELECT n.name, n.type, n.mention_count, n.first_seen, n.last_seen,
-                   GROUP_CONCAT(a.alias, '|||') AS aliases
+                   n.confidence, GROUP_CONCAT(a.alias, '|||') AS aliases
             FROM kg_nodes n
             LEFT JOIN kg_aliases a ON a.canonical = n.name COLLATE NOCASE
             GROUP BY n.name
@@ -299,17 +557,19 @@ class GraphStore:
                 "mentions": r[2] or 0,
                 "first_seen": r[3] or "",
                 "last_seen": r[4] or "",
-                "aliases": [x for x in (r[5] or "").split("|||") if x],
+                "confidence": r[5] if r[5] is not None else 1.0,
+                "aliases": [x for x in (r[6] or "").split("|||") if x],
             }
             for r in cur.fetchall()
         ]
 
     def get_all_edges(self) -> list[dict]:
-        """Return all edges for graph export."""
+        """Return all edges for graph export (includes temporal validity)."""
         cur = self.conn.cursor()
         cur.execute(
             """
-            SELECT source, target, rel_type, weight, evidence, event_time
+            SELECT source, target, rel_type, weight, evidence, event_time,
+                   valid_from, valid_until, last_reinforced
             FROM kg_edges
             ORDER BY weight DESC
             """
@@ -322,14 +582,81 @@ class GraphStore:
                 "weight": r[3] or 0.5,
                 "evidence": r[4] or "",
                 "event_time": r[5] or "",
+                "valid_from": r[6] or "",
+                "valid_until": r[7],
+                "last_reinforced": r[8] or "",
             }
             for r in cur.fetchall()
         ]
 
-    def find_path(self, source: str, target: str) -> GraphSearchResult:
+    def apply_confidence_decay(
+        self,
+        half_life_days: int = 90,
+        min_weight: float = 0.1,
+        reference_date: str = "",
+    ) -> list[dict]:
+        """Apply exponential decay to edge weights based on time since last reinforcement.
+
+        Formula: new_weight = weight * 0.5 ^ (days_since / half_life_days)
+        Edges with last_reinforced = '' (legacy) are skipped.
+        Returns list of edges that were updated, with old/new weights.
+        """
+        if half_life_days <= 0:
+            return []
+
+        ref = _date.fromisoformat(reference_date) if reference_date else datetime.now(timezone.utc).date()
+        ref_str = ref.isoformat()
+
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT id, source, target, rel_type, weight, last_reinforced
+            FROM kg_edges
+            WHERE last_reinforced != '' AND last_reinforced < ?
+                AND valid_until IS NULL
+            """,
+            (ref_str,),
+        )
+        rows = cur.fetchall()
+        if not rows:
+            return []
+
+        updated: list[dict] = []
+        for row in rows:
+            edge_id, source, target, rel_type, weight, lr = row
+            try:
+                lr_date = _date.fromisoformat(lr)
+            except ValueError:
+                continue  # malformed date — skip
+            days_since = (ref - lr_date).days
+            if days_since <= 0:
+                continue
+            new_weight = weight * (0.5 ** (days_since / half_life_days))
+            new_weight = max(new_weight, min_weight)
+            cur.execute("UPDATE kg_edges SET weight = ? WHERE id = ?", (new_weight, edge_id))
+            updated.append({
+                "source": source,
+                "target": target,
+                "rel_type": rel_type,
+                "old_weight": round(weight, 6),
+                "new_weight": round(new_weight, 6),
+                "days_since_reinforced": days_since,
+                "last_reinforced": lr,
+            })
+
+        if updated:
+            self.conn.commit()
+        return updated
+
+    def find_path(
+        self, source: str, target: str, include_historical: bool = False,
+    ) -> GraphSearchResult:
         """BFS shortest path between two entities (undirected)."""
         cur = self.conn.cursor()
-        cur.execute("SELECT source, target, rel_type, evidence, source_hash FROM kg_edges")
+        validity_clause = "" if include_historical else "WHERE valid_until IS NULL"
+        cur.execute(
+            f"SELECT source, target, rel_type, evidence, source_hash FROM kg_edges {validity_clause}"
+        )
         adj: dict[str, list[tuple[str, str, str, str]]] = {}
         for row in cur.fetchall():
             s, t, rel, ev, sh = row[0], row[1], row[2] or "", row[3] or "", row[4] or ""

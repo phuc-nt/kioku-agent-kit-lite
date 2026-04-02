@@ -144,11 +144,26 @@ class KiokuDB:
                 evidence TEXT DEFAULT '',
                 source_hash TEXT DEFAULT '',
                 event_time TEXT DEFAULT '',
+                valid_from TEXT DEFAULT '',
+                valid_until TEXT DEFAULT NULL,
                 UNIQUE(source, target, rel_type)
             )
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_edges_src ON kg_edges(source COLLATE NOCASE)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_edges_tgt ON kg_edges(target COLLATE NOCASE)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_edges_valid ON kg_edges(valid_until)")
+        # Migrations for older DBs
+        for col, default in [("valid_from", "''"), ("valid_until", "NULL"), ("last_reinforced", "''")]:
+            try:
+                cur.execute(f"ALTER TABLE kg_edges ADD COLUMN {col} TEXT DEFAULT {default}")
+            except sqlite3.OperationalError:
+                pass
+
+        # Migrations for older DBs
+        try:
+            cur.execute("ALTER TABLE kg_nodes ADD COLUMN confidence REAL DEFAULT 1.0")
+        except sqlite3.OperationalError:
+            pass
 
         # SAME_AS alias mapping
         cur.execute("""
@@ -161,6 +176,32 @@ class KiokuDB:
         """)
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_alias ON kg_aliases(alias COLLATE NOCASE)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_canonical ON kg_aliases(canonical COLLATE NOCASE)")
+
+        # Cluster table — refreshed on each clustering run
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS kg_clusters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                entity_name TEXT NOT NULL,
+                UNIQUE(cluster_id, entity_name)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_clusters_label ON kg_clusters(label COLLATE NOCASE)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_clusters_entity ON kg_clusters(entity_name COLLATE NOCASE)")
+
+        # Merge audit log
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS kg_merge_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_name TEXT NOT NULL,
+                target_name TEXT NOT NULL,
+                merge_type TEXT DEFAULT 'auto',
+                vector_sim REAL DEFAULT 0.0,
+                name_sim REAL DEFAULT 0.0,
+                timestamp TEXT NOT NULL
+            )
+        """)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 

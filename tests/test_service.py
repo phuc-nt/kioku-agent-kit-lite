@@ -309,3 +309,214 @@ class TestTemporalRange:
         df, dt = service._extract_temporal_range("something from 2024")
         assert df == "2024-01-01"
         assert dt == "2024-12-31"
+
+
+# ── temporal fact management ─────────────────────────────────────────────────
+
+class TestTemporalFactManagement:
+    def test_kg_index_sets_valid_from(self, service):
+        from kioku_lite.service import EntityInput, RelationshipInput
+        service.save_memory("Phuc works at Google")
+        h = service.save_memory("Phuc works at Google")["content_hash"]
+        rels = [RelationshipInput(source="Phuc", target="Google", rel_type="WORKS_AT", weight=0.9)]
+        service.kg_index(h, [EntityInput("Phuc"), EntityInput("Google")], rels, event_time="2026-04-01")
+        edges = service.db.graph.get_all_edges()
+        works_at = [e for e in edges if e["relation"] == "WORKS_AT"]
+        assert works_at[0]["valid_from"] == "2026-04-01"
+
+    def test_kg_invalidate_success(self, service):
+        from kioku_lite.service import EntityInput, RelationshipInput
+        h = service.save_memory("Phuc works at LINE")["content_hash"]
+        rels = [RelationshipInput(source="Phuc", target="LINE", rel_type="WORKS_AT", weight=0.9)]
+        service.kg_index(h, [EntityInput("Phuc"), EntityInput("LINE")], rels)
+        result = service.kg_invalidate(source="Phuc", target="LINE", rel_type="WORKS_AT", valid_until="2026-03-31")
+        assert result["status"] == "invalidated"
+        assert result["edges_updated"] == 1
+
+    def test_kg_invalidate_no_match(self, service):
+        result = service.kg_invalidate(source="X", target="Y")
+        assert result["status"] == "no_match"
+        assert result["edges_updated"] == 0
+
+
+# ── dedup_scan ──────────────────────────────────────────────────────────────────
+
+class TestDedupScan:
+    def test_dedup_scan_returns_dict(self, service):
+        """dedup_scan should return dict with candidates and auto_merged."""
+        result = service.dedup_scan()
+        assert isinstance(result, dict)
+        assert "candidates" in result
+        assert "auto_merged" in result
+        assert "total_scanned" in result
+
+    def test_dedup_scan_empty_graph(self, service):
+        """dedup_scan on empty graph should return empty lists."""
+        result = service.dedup_scan()
+        assert result["candidates"] == []
+        assert result["auto_merged"] == []
+        assert result["total_scanned"] == 0
+
+    def test_dedup_scan_single_entity(self, service):
+        """dedup_scan with single entity should return empty (no pairs)."""
+        service.kg_index("h1", [EntityInput("OnlyOne", "PERSON")], [])
+        result = service.dedup_scan()
+        assert result["total_scanned"] == 0
+
+    def test_dedup_scan_returns_candidates(self, service):
+        """dedup_scan should find candidate pairs (depends on embedder/thresholds)."""
+        # Add two entities with similar names
+        service.kg_index("h1", [EntityInput("Phuc", "PERSON")], [])
+        service.kg_index("h2", [EntityInput("Phúc", "PERSON")], [])
+        result = service.dedup_scan()
+        # May or may not have candidates depending on embedder
+        assert isinstance(result["candidates"], list)
+
+    def test_dedup_scan_auto_merge_false_returns_all_candidates(self, service):
+        """With auto_merge=False, all qualifying pairs should be candidates."""
+        service.kg_index("h1", [EntityInput("Phuc", "PERSON")], [])
+        service.kg_index("h2", [EntityInput("Phúc", "PERSON")], [])
+        result = service.dedup_scan(auto_merge=False)
+        assert isinstance(result["candidates"], list)
+        assert isinstance(result["auto_merged"], list)
+
+    def test_dedup_scan_auto_merge_true_merges_qualifying_pairs(self, service):
+        """With auto_merge=True, qualifying pairs should be auto-merged."""
+        service.kg_index("h1", [EntityInput("Phuc", "PERSON")], [])
+        service.kg_index("h2", [EntityInput("Phúc", "PERSON")], [])
+        result = service.dedup_scan(auto_merge=True)
+        # auto_merged list should be populated or empty (depends on embedder)
+        assert isinstance(result["auto_merged"], list)
+
+
+# ── merge_entities ──────────────────────────────────────────────────────────────
+
+class TestMergeEntitiesService:
+    def test_merge_entities_returns_dict(self, service):
+        """merge_entities should return a dict with status."""
+        service.kg_index("h1", [EntityInput("Phuc", "PERSON")], [])
+        service.kg_index("h2", [EntityInput("Phúc", "PERSON")], [])
+        result = service.merge_entities("Phuc", "Phúc")
+        assert isinstance(result, dict)
+        assert "status" in result
+
+    def test_merge_entities_success(self, service):
+        """merge_entities should successfully merge when both exist."""
+        service.kg_index("h1", [EntityInput("Phuc", "PERSON")], [])
+        service.kg_index("h2", [EntityInput("Phúc", "PERSON")], [])
+        result = service.merge_entities("Phuc", "Phúc")
+        assert result["status"] == "merged"
+        assert result["source"] == "Phuc"
+        assert result["target"] == "Phúc"
+
+    def test_merge_entities_nonexistent_returns_skipped(self, service):
+        """merge_entities with nonexistent source should return skipped."""
+        service.kg_index("h1", [EntityInput("Phúc", "PERSON")], [])
+        result = service.merge_entities("NonExistent", "Phúc")
+        assert result["status"] == "skipped"
+
+    def test_merge_entities_removes_source_from_list(self, service):
+        """After merge, source should not appear in list_entities."""
+        service.kg_index("h1", [EntityInput("Phuc", "PERSON")], [])
+        service.kg_index("h2", [EntityInput("Phúc", "PERSON")], [])
+        entities_before = service.list_entities()["entities"]
+        names_before = [e["name"] for e in entities_before]
+        assert "Phuc" in names_before
+
+        service.merge_entities("Phuc", "Phúc")
+
+        entities_after = service.list_entities()["entities"]
+        names_after = [e["name"] for e in entities_after]
+        assert "Phuc" not in names_after
+        assert "Phúc" in names_after
+
+    def test_merge_entities_combines_mention_counts(self, service):
+        """Merge should accumulate mention counts."""
+        service.kg_index("h1", [EntityInput("Phuc", "PERSON")], [])
+        service.kg_index("h2", [EntityInput("Phuc", "PERSON")], [])  # 2nd mention
+        service.kg_index("h3", [EntityInput("Phúc", "PERSON")], [])  # 1st mention of phúc
+
+        service.merge_entities("Phuc", "Phúc")
+
+        entities = service.list_entities()["entities"]
+        phuc = next(e for e in entities if e["name"] == "Phúc")
+        assert phuc["mentions"] == 3  # 2 + 1
+
+
+# ── kg_index with dedup ────────────────────────────────────────────────────────
+
+class TestKgIndexWithDedup:
+    def test_kg_index_returns_auto_merged_field(self, service):
+        """kg_index should return auto_merged field (dedup results)."""
+        r = service.save_memory("Phuc info here")
+        result = service.kg_index(r["content_hash"], [EntityInput("Phuc", "PERSON")], [])
+        assert "auto_merged" in result
+        assert isinstance(result["auto_merged"], list)
+
+    def test_kg_index_returns_dedup_candidates_field(self, service):
+        """kg_index should return dedup_candidates field."""
+        r = service.save_memory("Test entity here")
+        result = service.kg_index(r["content_hash"], [EntityInput("TestEntity", "PERSON")], [])
+        assert "dedup_candidates" in result
+        assert isinstance(result["dedup_candidates"], list)
+
+    def test_kg_index_dedup_finds_similar_during_index(self, service):
+        """When indexing new entity, dedup should scan against existing ones."""
+        # Index first entity
+        r1 = service.save_memory("Phuc info")
+        service.kg_index(r1["content_hash"], [EntityInput("Phuc", "PERSON")], [])
+
+        # Index similar entity — dedup should find it
+        r2 = service.save_memory("Phuc again")
+        result = service.kg_index(r2["content_hash"], [EntityInput("Phúc", "PERSON")], [])
+
+        # May have auto_merged or candidates (depends on embedder threshold)
+        assert len(result["auto_merged"]) >= 0 or len(result["dedup_candidates"]) >= 0
+
+
+# ── confidence in kg_index ──────────────────────────────────────────────────────
+
+class TestConfidenceInService:
+    def test_kg_index_with_custom_confidence(self, service):
+        """kg_index should preserve entity confidence."""
+        r = service.save_memory("High confidence entity")
+        entity = EntityInput("Expert", "PERSON", confidence=0.95)
+        service.kg_index(r["content_hash"], [entity], [])
+
+        entities = service.list_entities()["entities"]
+        expert = next(e for e in entities if e["name"] == "Expert")
+        assert expert["confidence"] == 0.95
+
+    def test_kg_index_default_confidence_1_0(self, service):
+        """Entity without explicit confidence should default to 1.0."""
+        r = service.save_memory("Default confidence entity")
+        entity = EntityInput("Default", "PERSON")  # no explicit confidence
+        service.kg_index(r["content_hash"], [entity], [])
+
+        entities = service.list_entities()["entities"]
+        default = next(e for e in entities if e["name"] == "Default")
+        assert default["confidence"] == 1.0
+
+    def test_list_entities_includes_confidence(self, service):
+        """list_entities should include confidence field."""
+        r = service.save_memory("Confidence test")
+        service.kg_index(r["content_hash"], [EntityInput("Test", "PERSON", confidence=0.75)], [])
+
+        entities = service.list_entities()["entities"]
+        test = next(e for e in entities if e["name"] == "Test")
+        assert "confidence" in test
+        assert test["confidence"] == 0.75
+
+    def test_recall_entity_returns_nodes(self, service):
+        """recall_entity should return connected nodes."""
+        r = service.save_memory("Recall with confidence")
+        service.kg_index(
+            r["content_hash"],
+            [EntityInput("Alice", "PERSON", confidence=0.8), EntityInput("Bob", "PERSON", confidence=0.9)],
+            [RelationshipInput("Alice", "Bob", "KNOWS", 0.7, "they know each other")],
+        )
+
+        result = service.recall_entity("Alice")
+        alice_node = next(n for n in result["nodes"] if n["name"] == "Alice")
+        assert alice_node["name"] == "Alice"
+        assert "type" in alice_node

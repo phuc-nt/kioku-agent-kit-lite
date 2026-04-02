@@ -30,6 +30,7 @@ class GraphNode:
     mention_count: int = 0
     first_seen: str = ""
     last_seen: str = ""
+    confidence: float = 1.0
 
 
 @dataclass
@@ -41,6 +42,9 @@ class GraphEdge:
     weight: float = 0.5
     evidence: str = ""
     source_hash: str = ""   # links back to SQLite memories for hydration
+    valid_from: str = ""           # when fact became true ('' = unknown)
+    valid_until: str | None = None  # when fact stopped being true (None = current)
+    last_reinforced: str = ""      # when edge was last re-confirmed ('' = legacy/unknown)
 
 
 @dataclass

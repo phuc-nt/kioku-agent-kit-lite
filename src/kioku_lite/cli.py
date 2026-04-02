@@ -1,17 +1,20 @@
 """Kioku Lite CLI — zero Docker, zero cloud LLM.
 
 Commands:
-  save          Save a memory. Returns content_hash for kg-index.
-  search        Tri-hybrid search (BM25 + Vector + Graph).
-  kg-index      Agent-provided entity/relationship indexing for a saved memory.
-  kg-alias      Register SAME_AS aliases for a canonical entity.
-  recall        Recall everything related to an entity.
-  connect       Explain connection between two entities.
-  entities      List top entities in the knowledge graph.
-  timeline      Chronological memory list.
-  export-graph  Export knowledge graph as interactive HTML or JSON.
-  setup         First-time setup (download embedding model, create config).
-  init          Generate CLAUDE.md + SKILL.md for Claude Code / Cursor.
+  save            Save a memory. Returns content_hash for kg-index.
+  search          Tri-hybrid search (BM25 + Vector + Graph).
+  kg-index        Agent-provided entity/relationship indexing for a saved memory.
+  kg-alias        Register SAME_AS aliases for a canonical entity.
+  kg-invalidate   Mark a knowledge graph edge as no longer valid.
+  dedup-scan      Scan entities for near-duplicates; optionally auto-merge.
+  merge           Manually merge two entities (source -> target).
+  recall          Recall everything related to an entity.
+  connect         Explain connection between two entities.
+  entities        List top entities in the knowledge graph.
+  timeline        Chronological memory list.
+  export-graph    Export knowledge graph as interactive HTML or JSON.
+  setup           First-time setup (download embedding model, create config).
+  init            Generate CLAUDE.md + SKILL.md for Claude Code / Cursor.
 """
 
 from __future__ import annotations
@@ -99,7 +102,11 @@ def kg_index(
     if entities:
         try:
             raw = json.loads(entities)
-            entity_list = [EntityInput(name=e["name"], type=e.get("type", "TOPIC")) for e in raw]
+            entity_list = [
+                EntityInput(name=e["name"], type=e.get("type", "TOPIC"),
+                            confidence=float(e.get("confidence", 1.0)))
+                for e in raw
+            ]
         except (json.JSONDecodeError, KeyError) as err:
             typer.echo(f"Error parsing --entities JSON: {err}", err=True)
             raise typer.Exit(1)
@@ -148,6 +155,67 @@ def kg_alias(
     _out(_get_svc().kg_alias(canonical, alias_list))
 
 
+# ── dedup-scan ────────────────────────────────────────────────────────────────
+
+@app.command(name="dedup-scan")
+def dedup_scan(
+    auto: bool = typer.Option(False, "--auto", help="Automatically merge qualifying pairs."),
+) -> None:
+    """Scan all entities for near-duplicates and surface merge candidates.
+
+    With --auto: auto-merges pairs that meet both vector and name similarity
+    thresholds (vec >= 0.98 AND name >= 0.85).
+
+    \b
+    Examples:
+      kioku-lite dedup-scan
+      kioku-lite dedup-scan --auto
+    """
+    _out(_get_svc().dedup_scan(auto_merge=auto))
+
+
+# ── merge ─────────────────────────────────────────────────────────────────────
+
+@app.command()
+def merge(
+    source: str = typer.Argument(..., help="Entity name to merge FROM (will be deleted)."),
+    target: str = typer.Argument(..., help="Entity name to merge INTO (will be kept)."),
+) -> None:
+    """Manually merge two entities: source is absorbed into target.
+
+    All edges are re-pointed, source is registered as an alias, and
+    the source node is removed.
+
+    \b
+    Example:
+      kioku-lite merge "Phuc" "Phúc"
+    """
+    _out(_get_svc().merge_entities(source, target))
+
+
+# ── kg-invalidate ─────────────────────────────────────────────────────────────
+
+@app.command(name="kg-invalidate")
+def kg_invalidate(
+    source: str = typer.Option(..., "--source", "-s", help="Source entity."),
+    target: str = typer.Option(..., "--target", "-t", help="Target entity."),
+    rel_type: Optional[str] = typer.Option(None, "--rel-type", "-r", help="Relationship type (optional)."),
+    date: Optional[str] = typer.Option(None, "--date", "-d", help="When fact became invalid (YYYY-MM-DD). Defaults to today."),
+    reason: Optional[str] = typer.Option("", "--reason", help="Why this fact is no longer valid."),
+) -> None:
+    """Mark a knowledge graph edge as no longer valid (superseded).
+
+    \b
+    Example — Phuc changed jobs:
+      kioku-lite kg-invalidate --source Phuc --target LINE --rel-type WORKS_AT --date 2026-03-31
+    """
+    result = _get_svc().kg_invalidate(
+        source=source, target=target, rel_type=rel_type,
+        valid_until=date, reason=reason or "",
+    )
+    _out(result)
+
+
 # ── search ─────────────────────────────────────────────────────────────────────
 
 @app.command()
@@ -157,10 +225,14 @@ def search(
     date_from: Optional[str] = typer.Option(None, "--from", help="Start date YYYY-MM-DD."),
     date_to: Optional[str] = typer.Option(None, "--to", help="End date YYYY-MM-DD."),
     entities: Optional[str] = typer.Option(None, "--entities", "-e", help="Comma-separated entity names for KG seeding."),
+    include_historical: bool = typer.Option(False, "--include-historical", help="Include superseded facts."),
 ) -> None:
     """Tri-hybrid search: BM25 + Vector (FastEmbed) + Knowledge Graph → RRF rerank."""
     entity_list = [e.strip() for e in entities.split(",")] if entities else None
-    _out(_get_svc().search_memories(query, limit=limit, date_from=date_from, date_to=date_to, entities=entity_list))
+    _out(_get_svc().search_memories(
+        query, limit=limit, date_from=date_from, date_to=date_to,
+        entities=entity_list, include_historical=include_historical,
+    ))
 
 
 # ── recall ─────────────────────────────────────────────────────────────────────
@@ -170,9 +242,10 @@ def recall(
     entity: str = typer.Argument(..., help="Entity name to recall memories for."),
     hops: int = typer.Option(2, "--hops", help="Graph traversal depth."),
     limit: int = typer.Option(10, "--limit", "-l"),
+    include_historical: bool = typer.Option(False, "--include-historical", help="Include superseded facts."),
 ) -> None:
     """Recall all memories related to an entity via knowledge graph traversal."""
-    _out(_get_svc().recall_entity(entity, max_hops=hops, limit=limit))
+    _out(_get_svc().recall_entity(entity, max_hops=hops, limit=limit, include_historical=include_historical))
 
 
 # ── connect ────────────────────────────────────────────────────────────────────
@@ -181,9 +254,10 @@ def recall(
 def connect(
     entity_a: str = typer.Argument(...),
     entity_b: str = typer.Argument(...),
+    include_historical: bool = typer.Option(False, "--include-historical", help="Include superseded facts."),
 ) -> None:
     """Explain how two entities are connected in the knowledge graph."""
-    _out(_get_svc().explain_connection(entity_a, entity_b))
+    _out(_get_svc().explain_connection(entity_a, entity_b, include_historical=include_historical))
 
 
 # ── entities ───────────────────────────────────────────────────────────────────
@@ -469,6 +543,71 @@ def install_profile(
     typer.echo("")
     typer.echo(f"Make sure you select the right profile with: kioku-lite users --use {profile_name}")
     typer.echo("")
+
+
+# ── clusters ──────────────────────────────────────────────────────────────────
+
+@app.command(name="clusters")
+def clusters_cmd(
+    include_historical: bool = typer.Option(False, "--include-historical", help="Include superseded edges."),
+) -> None:
+    """Detect and list entity clusters in the knowledge graph.
+
+    Groups connected entities into communities and shows each cluster
+    with its suggested label and entity count.
+
+    \b
+    Example:
+      kioku-lite clusters
+    """
+    _out(_get_svc().detect_clusters(include_historical=include_historical))
+
+
+@app.command(name="cluster")
+def cluster_cmd(
+    label: str = typer.Argument(..., help="Cluster label to inspect."),
+) -> None:
+    """Show all entities and connected memories in a named cluster.
+
+    Use 'kioku-lite clusters' first to see available cluster labels.
+
+    \b
+    Example:
+      kioku-lite cluster PERSON
+    """
+    _out(_get_svc().get_cluster(label))
+
+
+# ── consolidate ───────────────────────────────────────────────────────────────
+
+@app.command()
+def consolidate(
+    half_life: int = typer.Option(90, "--half-life", help="Decay half-life in days."),
+    older_than: int = typer.Option(30, "--older-than", help="Surface memories older than N days."),
+    auto_merge: bool = typer.Option(False, "--auto-merge", help="Auto-merge qualifying duplicate pairs."),
+) -> None:
+    """Consolidate knowledge graph: decay stale edges, find duplicates, surface old memories.
+
+    Agent-driven: this command surfaces data for the agent to act on.
+
+    \b
+    Output sections:
+      decay           — edges whose weights were reduced (agent can reinforce or invalidate)
+      merge_suggestions — duplicate entity pairs (agent can approve or reject)
+      stale_memories  — old memories (agent can summarize into weekly/monthly entries)
+
+    \b
+    Examples:
+      kioku-lite consolidate
+      kioku-lite consolidate --half-life 30
+      kioku-lite consolidate --older-than 60 --auto-merge
+    """
+    result = _get_svc().consolidate(
+        half_life_days=half_life,
+        older_than_days=older_than,
+        auto_merge=auto_merge,
+    )
+    _out(result)
 
 
 @app.command(name="export-graph")

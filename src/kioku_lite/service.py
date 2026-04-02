@@ -25,6 +25,7 @@ warnings.filterwarnings(
 
 from kioku_lite.config import Settings
 from kioku_lite.pipeline.db import KiokuDB
+from kioku_lite.pipeline.dedup import DedupEngine
 from kioku_lite.pipeline.embedder import make_embedder
 from kioku_lite.search.bm25 import bm25_search
 from kioku_lite.search.graph import graph_search
@@ -42,6 +43,7 @@ JST = timezone(timedelta(hours=7))
 class EntityInput:
     name: str
     type: str = "TOPIC"
+    confidence: float = 1.0
 
 
 @dataclass
@@ -59,8 +61,7 @@ class KiokuLiteService:
     """Core business logic for Kioku Lite. Used by CLI only (no MCP)."""
 
     def __init__(self, settings: Settings | None = None) -> None:
-        from kioku_lite.config import settings as default_settings
-        self.settings = settings or default_settings
+        self.settings = settings or Settings()
         self.settings.ensure_dirs()
 
         self.db = KiokuDB(self.settings.db_path, embed_dim=self.settings.embed_dim)
@@ -151,7 +152,38 @@ class KiokuLiteService:
         et = event_time or date
 
         for entity in entities:
-            self.db.graph.upsert_node(entity.name, entity.type, date)
+            self.db.graph.upsert_node(entity.name, entity.type, date, confidence=entity.confidence)
+
+        # Dedup: find and auto-merge near-duplicate entities
+        dedup_engine = DedupEngine()
+        all_auto_merged = []
+        all_candidates = []
+        for entity in entities:
+            try:
+                dedup_result = dedup_engine.find_similar(
+                    entity.name, self.embedder, self.db.conn
+                )
+                for action in dedup_result.auto_merged:
+                    merge_out = self.db.graph.merge_entities(
+                        action.source_name, action.target_name,
+                        "auto", action.vector_sim, action.name_sim,
+                    )
+                    if merge_out.get("status") == "merged":
+                        all_auto_merged.append({
+                            "source": action.source_name,
+                            "target": action.target_name,
+                            "vector_sim": round(action.vector_sim, 4),
+                            "name_sim": round(action.name_sim, 4),
+                        })
+                for cand in dedup_result.candidates:
+                    all_candidates.append({
+                        "source": cand.source_name,
+                        "target": cand.target_name,
+                        "vector_sim": round(cand.vector_sim, 4),
+                        "name_sim": round(cand.name_sim, 4),
+                    })
+            except Exception as e:
+                log.warning("Dedup failed for entity '%s': %s", entity.name, e)
 
         for rel in relationships:
             self.db.graph.upsert_edge(
@@ -162,6 +194,7 @@ class KiokuLiteService:
                 evidence=rel.evidence,
                 source_hash=content_hash,
                 event_time=et,
+                valid_from=et,
             )
 
         log.info(
@@ -173,6 +206,30 @@ class KiokuLiteService:
             "content_hash": content_hash,
             "entities_added": len(entities),
             "relationships_added": len(relationships),
+            "auto_merged": all_auto_merged,
+            "dedup_candidates": all_candidates,
+        }
+
+    # ── kg_invalidate ──────────────────────────────────────────────────────────
+
+    def kg_invalidate(
+        self,
+        source: str,
+        target: str,
+        rel_type: str | None = None,
+        valid_until: str | None = None,
+        reason: str = "",
+    ) -> dict:
+        """Mark edge(s) as no longer valid (superseded by newer facts)."""
+        date = valid_until or datetime.now(JST).strftime("%Y-%m-%d")
+        count = self.db.graph.invalidate_edge(
+            valid_until=date, source=source, target=target, rel_type=rel_type,
+        )
+        return {
+            "status": "invalidated" if count > 0 else "no_match",
+            "edges_updated": count,
+            "valid_until": date,
+            "reason": reason,
         }
 
     # ── kg_alias ───────────────────────────────────────────────────────────────
@@ -186,6 +243,52 @@ class KiokuLiteService:
                 added.append(alias)
         return {"status": "ok", "canonical": canonical, "aliases_added": added}
 
+    # ── dedup ──────────────────────────────────────────────────────────────────
+
+    def dedup_scan(self, auto_merge: bool = False) -> dict:
+        """Scan all entities for near-duplicates.
+
+        If auto_merge=True, automatically merges pairs that meet both
+        vec_auto + name_auto thresholds.
+        """
+        engine = DedupEngine()
+        candidates = engine.scan_all(self.db.conn, self.embedder)
+        merged = []
+        remaining_candidates = []
+
+        for cand in candidates:
+            if (auto_merge
+                    and cand.vector_sim >= engine.vec_auto
+                    and cand.name_sim >= engine.name_auto):
+                result = self.db.graph.merge_entities(
+                    cand.source_name, cand.target_name,
+                    "auto", cand.vector_sim, cand.name_sim,
+                )
+                if result.get("status") == "merged":
+                    merged.append({
+                        "source": cand.source_name,
+                        "target": cand.target_name,
+                        "vector_sim": round(cand.vector_sim, 4),
+                        "name_sim": round(cand.name_sim, 4),
+                    })
+                    continue
+            remaining_candidates.append({
+                "source": cand.source_name,
+                "target": cand.target_name,
+                "vector_sim": round(cand.vector_sim, 4),
+                "name_sim": round(cand.name_sim, 4),
+            })
+
+        return {
+            "candidates": remaining_candidates,
+            "auto_merged": merged,
+            "total_scanned": len(candidates),
+        }
+
+    def merge_entities(self, source: str, target: str) -> dict:
+        """Manually merge source entity into target (alias + edge re-point)."""
+        return self.db.graph.merge_entities(source, target, merge_type="manual")
+
     # ── search_memories ────────────────────────────────────────────────────────
 
     def search_memories(
@@ -195,6 +298,7 @@ class KiokuLiteService:
         date_from: str | None = None,
         date_to: str | None = None,
         entities: list[str] | None = None,
+        include_historical: bool = False,
     ) -> dict:
         """Tri-hybrid search: BM25 + Vector + Graph → RRF rerank → SQLite hydration."""
         clean_query = re.sub(r"[^\w\s]", " ", query)
@@ -214,11 +318,11 @@ class KiokuLiteService:
             entity_lower = [e.lower() for e in entities]
             vec_results = [r for r in vec_all if any(ent in r.content.lower() for ent in entity_lower)]
 
-            kg_results = graph_search(self.db.graph, query, limit=limit * 3, entities=entities)
+            kg_results = graph_search(self.db.graph, query, limit=limit * 3, entities=entities, include_historical=include_historical)
         else:
             bm25_results = bm25_search(self.db.memory, clean_query, limit=limit * 3)
             vec_results = vector_search(self.db.memory, self.embedder, query, limit=limit * 3)
-            kg_results = graph_search(self.db.graph, query, limit=limit * 3)
+            kg_results = graph_search(self.db.graph, query, limit=limit * 3, include_historical=include_historical)
 
         results = rrf_rerank(bm25_results, vec_results, kg_results, limit=limit)
 
@@ -312,9 +416,11 @@ class KiokuLiteService:
 
     # ── recall / explain ───────────────────────────────────────────────────────
 
-    def recall_entity(self, entity: str, max_hops: int = 2, limit: int = 10) -> dict:
+    def recall_entity(
+        self, entity: str, max_hops: int = 2, limit: int = 10, include_historical: bool = False,
+    ) -> dict:
         """Recall everything related to an entity via graph traversal + hydration."""
-        result = self.db.graph.traverse(entity, max_hops=max_hops, limit=limit)
+        result = self.db.graph.traverse(entity, max_hops=max_hops, limit=limit, include_historical=include_historical)
         hashes = list({e.source_hash for e in result.edges if e.source_hash})
         hydrated = self.db.memory.get_by_hashes(hashes) if hashes else {}
 
@@ -329,9 +435,11 @@ class KiokuLiteService:
             ],
         }
 
-    def explain_connection(self, entity_a: str, entity_b: str) -> dict:
+    def explain_connection(
+        self, entity_a: str, entity_b: str, include_historical: bool = False,
+    ) -> dict:
         """Find and explain the path between two entities in the graph."""
-        result = self.db.graph.find_path(entity_a, entity_b)
+        result = self.db.graph.find_path(entity_a, entity_b, include_historical=include_historical)
         hashes = list({e.source_hash for e in result.edges if e.source_hash})
         hydrated = self.db.memory.get_by_hashes(hashes) if hashes else {}
 
@@ -389,6 +497,106 @@ class KiokuLiteService:
             if 1900 <= y <= 2100:
                 return f"{y}-01-01", f"{y}-12-31"
         return None, None
+
+    # ── consolidate ────────────────────────────────────────────────────────────
+
+    def consolidate(
+        self,
+        half_life_days: int = 90,
+        older_than_days: int = 30,
+        auto_merge: bool = False,
+    ) -> dict:
+        """Run all consolidation steps. Returns report for agent to act on.
+
+        Steps:
+          1. Apply confidence decay to KG edges
+          2. Scan for near-duplicate entities (reuse dedup engine)
+          3. Surface stale memories older than `older_than_days`
+        """
+        from kioku_lite.pipeline.consolidation import (
+            build_decay_report,
+            build_stale_report,
+            stale_cutoff,
+        )
+
+        # Step 1: confidence decay
+        decayed = self.db.graph.apply_confidence_decay(half_life_days=half_life_days)
+
+        # Step 2: dedup scan
+        dedup_result = self.dedup_scan(auto_merge=auto_merge)
+
+        # Step 3: stale memories
+        cutoff = stale_cutoff(older_than_days)
+        stale = self.db.memory.get_timeline(end_date=cutoff.isoformat(), limit=50)
+
+        # Step 4: cluster detection (lightweight — just count)
+        from kioku_lite.pipeline.clustering import find_communities
+        communities = find_communities(self.db.conn)
+        self.db.graph.save_clusters(communities)
+
+        return {
+            "decay": build_decay_report(decayed, half_life_days),
+            "merge_suggestions": {
+                "candidates": dedup_result.get("candidates", []),
+                "auto_merged": dedup_result.get("auto_merged", []),
+            },
+            "stale_memories": build_stale_report(stale, cutoff),
+            "clusters": {
+                "cluster_count": len(communities),
+                "total_entities": sum(len(c.entities) for c in communities),
+            },
+        }
+
+    # ── cluster detection ──────────────────────────────────────────────────────
+
+    def detect_clusters(self, include_historical: bool = False) -> dict:
+        """Run connected-component clustering, persist results, return summary."""
+        from kioku_lite.pipeline.clustering import find_communities
+
+        communities = find_communities(self.db.conn, include_historical=include_historical)
+        self.db.graph.save_clusters(communities)
+
+        return {
+            "status": "clustered",
+            "cluster_count": len(communities),
+            "total_entities": sum(len(c.entities) for c in communities),
+            "clusters": [
+                {
+                    "cluster_id": c.id,
+                    "label": c.label,
+                    "entity_count": len(c.entities),
+                    "edge_count": c.edge_count,
+                }
+                for c in communities
+            ],
+        }
+
+    def get_cluster(self, label: str) -> dict:
+        """Return entities in the named cluster and their connected memories."""
+        entities = self.db.graph.get_cluster_entities(label)
+        if not entities:
+            return {"status": "not_found", "label": label, "entities": [], "memories": []}
+
+        hashes: set[str] = set()
+        for entity in entities:
+            result = self.db.graph.traverse(entity, max_hops=1, limit=20)
+            for edge in result.edges:
+                if edge.source_hash:
+                    hashes.add(edge.source_hash)
+
+        hydrated = self.db.memory.get_by_hashes(list(hashes)) if hashes else {}
+
+        return {
+            "status": "ok",
+            "label": label,
+            "entity_count": len(entities),
+            "entities": entities,
+            "memory_count": len(hydrated),
+            "memories": [
+                {"content": v["text"], "date": v.get("date", ""), "content_hash": k}
+                for k, v in hydrated.items()
+            ],
+        }
 
     # ── export ─────────────────────────────────────────────────────────────────
 

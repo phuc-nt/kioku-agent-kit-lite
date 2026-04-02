@@ -8,8 +8,8 @@ from kioku_lite.pipeline.graph_store import GraphStore
 from kioku_lite.pipeline.models import GraphEdge, GraphNode
 
 
-def _add_node(graph: GraphStore, name: str, entity_type: str = "PERSON", date: str = "2026-02-27") -> None:
-    graph.upsert_node(name, entity_type, date)
+def _add_node(graph: GraphStore, name: str, entity_type: str = "PERSON", date: str = "2026-02-27", confidence: float = 1.0) -> None:
+    graph.upsert_node(name, entity_type, date, confidence=confidence)
 
 
 def _add_edge(graph: GraphStore, src: str, tgt: str, rel: str = "KNOWS", weight: float = 0.7, evidence: str = "", h: str = "") -> None:
@@ -357,3 +357,331 @@ class TestAdaptiveHopLimit:
         result = graph.traverse("Boundary", max_hops=2)
         node_names = {n.name for n in result.nodes}
         assert any(n.startswith("Grand") for n in node_names)
+
+
+# ── Temporal Facts ────────────────────────────────────────────────────────────
+
+class TestTemporalFacts:
+    """Tests for valid_from/valid_until temporal columns on edges."""
+
+    def test_upsert_edge_stores_valid_from(self, graph):
+        graph.upsert_edge("A", "B", "WORKS_AT", 0.8, "ev", "h1", valid_from="2026-01-01")
+        edges = graph.get_all_edges()
+        assert edges[0]["valid_from"] == "2026-01-01"
+
+    def test_upsert_edge_default_valid_from_empty(self, graph):
+        graph.upsert_edge("A", "B", "KNOWS", 0.5, "", "h1")
+        edges = graph.get_all_edges()
+        assert edges[0]["valid_from"] == ""
+
+    def test_invalidate_edge_sets_valid_until(self, graph):
+        graph.upsert_edge("A", "B", "WORKS_AT", 0.8, "", "h1")
+        count = graph.invalidate_edge("2026-03-31", source="A", target="B")
+        assert count == 1
+        edges = graph.get_all_edges()
+        assert edges[0]["valid_until"] == "2026-03-31"
+
+    def test_invalidate_edge_by_source_target_rel(self, graph):
+        graph.upsert_edge("A", "B", "WORKS_AT", 0.8, "", "h1")
+        graph.upsert_edge("A", "B", "FRIENDS", 0.5, "", "h2")
+        count = graph.invalidate_edge("2026-03-31", source="A", target="B", rel_type="WORKS_AT")
+        assert count == 1
+        edges = graph.get_all_edges()
+        invalidated = [e for e in edges if e["valid_until"] is not None]
+        assert len(invalidated) == 1
+        assert invalidated[0]["relation"] == "WORKS_AT"
+
+    def test_invalidate_edge_no_match_returns_zero(self, graph):
+        graph.upsert_edge("A", "B", "KNOWS", 0.5, "", "h1")
+        count = graph.invalidate_edge("2026-03-31", source="X", target="Y")
+        assert count == 0
+
+    def test_traverse_excludes_invalidated(self, graph):
+        _add_node(graph, "A")
+        _add_node(graph, "B")
+        _add_node(graph, "C")
+        graph.upsert_edge("A", "B", "KNOWS", 0.8, "", "h1")
+        graph.upsert_edge("A", "C", "WORKS_AT", 0.7, "", "h2")
+        graph.invalidate_edge("2026-03-31", source="A", target="C")
+        result = graph.traverse("A", max_hops=2)
+        targets = {e.target for e in result.edges}
+        assert "B" in targets
+        assert "C" not in targets
+
+    def test_traverse_include_historical(self, graph):
+        _add_node(graph, "A")
+        _add_node(graph, "B")
+        graph.upsert_edge("A", "B", "WORKS_AT", 0.8, "", "h1")
+        graph.invalidate_edge("2026-03-31", source="A", target="B")
+        result = graph.traverse("A", max_hops=2, include_historical=True)
+        assert len(result.edges) == 1
+        assert result.edges[0].valid_until == "2026-03-31"
+
+    def test_find_path_excludes_invalidated(self, graph):
+        _add_node(graph, "A")
+        _add_node(graph, "B")
+        _add_node(graph, "C")
+        graph.upsert_edge("A", "B", "KNOWS", 0.8, "", "h1")
+        graph.upsert_edge("B", "C", "KNOWS", 0.7, "", "h2")
+        graph.invalidate_edge("2026-03-31", source="B", target="C")
+        result = graph.find_path("A", "C")
+        assert len(result.paths) == 0  # path broken by invalidation
+        result_hist = graph.find_path("A", "C", include_historical=True)
+        assert len(result_hist.paths) == 1
+
+    def test_get_all_edges_includes_validity(self, graph):
+        graph.upsert_edge("A", "B", "KNOWS", 0.5, "", "h1", valid_from="2026-01-01")
+        edges = graph.get_all_edges()
+        assert "valid_from" in edges[0]
+        assert "valid_until" in edges[0]
+        assert edges[0]["valid_from"] == "2026-01-01"
+        assert edges[0]["valid_until"] is None
+
+    def test_backward_compat_null_valid_until(self, graph):
+        """Edges with NULL valid_until are returned by default traverse."""
+        _add_node(graph, "A")
+        _add_node(graph, "B")
+        graph.upsert_edge("A", "B", "KNOWS", 0.8, "", "h1")
+        result = graph.traverse("A", max_hops=2)
+        assert len(result.edges) == 1  # NULL valid_until passes filter
+
+
+# ── merge_entities ────────────────────────────────────────────────────────────
+
+class TestMergeEntities:
+    def test_basic_merge_re_points_edges(self, graph):
+        """merge_entities should re-point edges from source to target."""
+        _add_node(graph, "Phuc")
+        _add_node(graph, "Phúc")
+        _add_node(graph, "LINE")
+        _add_edge(graph, "Phuc", "LINE", "WORKS_AT", 0.9, "evidence", "h1")
+
+        result = graph.merge_entities("Phuc", "Phúc", "test", 0.99, 0.95)
+        assert result["status"] == "merged"
+        assert result["source"] == "Phuc"
+        assert result["target"] == "Phúc"
+
+        # Check that edge was re-pointed
+        edges = graph.get_all_edges()
+        work_edges = [e for e in edges if e["relation"] == "WORKS_AT"]
+        assert len(work_edges) == 1
+        assert work_edges[0]["source"] == "Phúc"
+        assert work_edges[0]["target"] == "LINE"
+
+    def test_merge_deletes_source_node(self, graph):
+        """After merge, source node should be deleted."""
+        _add_node(graph, "Phuc")
+        _add_node(graph, "Phúc")
+        entities_before = graph.get_canonical_entities(limit=50)
+        phuc_names = [e["name"] for e in entities_before]
+        assert "Phuc" in phuc_names
+
+        graph.merge_entities("Phuc", "Phúc", "test", 0.99, 0.95)
+
+        entities_after = graph.get_canonical_entities(limit=50)
+        phuc_names = [e["name"] for e in entities_after]
+        assert "Phuc" not in phuc_names
+        assert "Phúc" in phuc_names
+
+    def test_merge_accumulates_mention_count(self, graph):
+        """Merge should add source's mention_count to target."""
+        _add_node(graph, "Phuc")
+        _add_node(graph, "Phuc")  # 2 mentions
+        _add_node(graph, "Phúc")
+        _add_node(graph, "Phúc")
+        _add_node(graph, "Phúc")  # 3 mentions
+
+        graph.merge_entities("Phuc", "Phúc", "test", 0.99, 0.95)
+
+        entities = graph.get_canonical_entities(limit=50)
+        phuc = next(e for e in entities if e["name"] == "Phúc")
+        assert phuc["mentions"] == 5  # 2 + 3
+
+    def test_merge_creates_alias(self, graph):
+        """Merge should register source as alias of target."""
+        _add_node(graph, "Phuc")
+        _add_node(graph, "Phúc")
+
+        graph.merge_entities("Phuc", "Phúc", "test", 0.99, 0.95)
+
+        entities = graph.get_canonical_entities(limit=50)
+        phuc = next(e for e in entities if e["name"] == "Phúc")
+        assert "Phuc" in phuc["aliases"]
+
+    def test_merge_handles_two_edges_to_same_target(self, graph):
+        """After merge, edges pointing to same target should be preserved."""
+        _add_node(graph, "Phuc")
+        _add_node(graph, "Phúc")
+        _add_node(graph, "TBV")
+        _add_node(graph, "LINE")
+        # Phuc points to two different targets
+        _add_edge(graph, "Phuc", "TBV", "WORKS_AT", 0.8, "e1", "h1")
+        _add_edge(graph, "Phuc", "LINE", "KNOWS", 0.6, "e2", "h2")
+
+        graph.merge_entities("Phuc", "Phúc", "test", 0.99, 0.95)
+
+        edges = graph.get_all_edges()
+        # Both edges should now point from Phúc
+        phuc_edges = [e for e in edges if e["source"] == "Phúc"]
+        assert len(phuc_edges) == 2
+        targets = {e["target"] for e in phuc_edges}
+        assert "TBV" in targets
+        assert "LINE" in targets
+
+    def test_merge_nonexistent_source_returns_skipped(self, graph):
+        """merge_entities with nonexistent source should return skipped."""
+        _add_node(graph, "Phúc")
+
+        result = graph.merge_entities("NonExistent", "Phúc", "test", 0.99, 0.95)
+        assert result["status"] == "skipped"
+        assert result["reason"] == "source not found"
+
+    def test_merge_nonexistent_target_returns_skipped(self, graph):
+        """merge_entities with nonexistent target should return skipped."""
+        _add_node(graph, "Phuc")
+
+        result = graph.merge_entities("Phuc", "NonExistent", "test", 0.99, 0.95)
+        assert result["status"] == "skipped"
+        assert result["reason"] == "target not found"
+
+    def test_merge_self_noop(self, graph):
+        """Merging entity with itself should be a no-op."""
+        _add_node(graph, "Phuc")
+
+        result = graph.merge_entities("Phuc", "Phuc", "test", 0.99, 0.95)
+        assert result["status"] == "skipped"
+        assert result["reason"] == "self-merge"
+
+    def test_merge_case_insensitive_self_check(self, graph):
+        """Self-merge check should be case-insensitive."""
+        _add_node(graph, "Phuc")
+
+        result = graph.merge_entities("phuc", "PHUC", "test", 0.99, 0.95)
+        assert result["status"] == "skipped"
+        assert result["reason"] == "self-merge"
+
+    def test_merge_removes_self_loops(self, graph):
+        """After re-pointing, self-loops (target→target) should be removed."""
+        _add_node(graph, "Phuc")
+        _add_node(graph, "Phúc")
+        # Create edge that will become a self-loop
+        _add_edge(graph, "Phuc", "Phuc", "SAME_AS", 0.9, "", "h1")
+
+        graph.merge_entities("Phuc", "Phúc", "test", 0.99, 0.95)
+
+        edges = graph.get_all_edges()
+        self_loops = [e for e in edges if e["source"] == e["target"]]
+        assert len(self_loops) == 0
+
+    def test_merge_logs_to_kg_merge_log(self, graph):
+        """Merge should create entry in kg_merge_log table."""
+        _add_node(graph, "Phuc")
+        _add_node(graph, "Phúc")
+
+        graph.merge_entities("Phuc", "Phúc", "auto", 0.99, 0.95)
+
+        cur = graph.conn.cursor()
+        cur.execute("SELECT source_name, target_name, merge_type FROM kg_merge_log ORDER BY timestamp DESC LIMIT 1")
+        row = cur.fetchone()
+        assert row is not None
+        assert row[0] == "Phuc"
+        assert row[1] == "Phúc"
+        assert row[2] == "auto"
+
+    def test_merge_preserves_other_nodes(self, graph):
+        """Merge should not affect unrelated nodes."""
+        _add_node(graph, "Phuc")
+        _add_node(graph, "Phúc")
+        _add_node(graph, "TBV")
+
+        graph.merge_entities("Phuc", "Phúc", "test", 0.99, 0.95)
+
+        entities = graph.get_canonical_entities(limit=50)
+        names = [e["name"] for e in entities]
+        assert "TBV" in names
+
+
+# ── confidence_scoring ────────────────────────────────────────────────────────
+
+class TestConfidenceScoring:
+    def test_default_confidence_is_1_0(self, graph):
+        """upsert_node without explicit confidence should default to 1.0."""
+        _add_node(graph, "Phuc", "PERSON", "2026-02-27")
+
+        entities = graph.get_canonical_entities(limit=50)
+        phuc = next(e for e in entities if e["name"] == "Phuc")
+        assert phuc["confidence"] == 1.0
+
+    def test_custom_confidence_preserved(self, graph):
+        """upsert_node with custom confidence should be stored."""
+        graph.upsert_node("Phuc", "PERSON", "2026-02-27", confidence=0.7)
+
+        entities = graph.get_canonical_entities(limit=50)
+        phuc = next(e for e in entities if e["name"] == "Phuc")
+        assert phuc["confidence"] == 0.7
+
+    def test_confidence_max_on_reupset(self, graph):
+        """Re-upsert with higher confidence should raise it."""
+        graph.upsert_node("Phuc", "PERSON", "2026-02-27", confidence=0.5)
+        graph.upsert_node("Phuc", "PERSON", "2026-02-28", confidence=0.8)
+
+        entities = graph.get_canonical_entities(limit=50)
+        phuc = next(e for e in entities if e["name"] == "Phuc")
+        assert phuc["confidence"] == 0.8  # Should be MAX
+
+    def test_confidence_never_lowered(self, graph):
+        """Re-upsert with lower confidence should NOT lower it."""
+        graph.upsert_node("Phuc", "PERSON", "2026-02-27", confidence=0.8)
+        graph.upsert_node("Phuc", "PERSON", "2026-02-28", confidence=0.5)
+
+        entities = graph.get_canonical_entities(limit=50)
+        phuc = next(e for e in entities if e["name"] == "Phuc")
+        assert phuc["confidence"] == 0.8  # Should still be 0.8
+
+    def test_search_nodes_respects_min_confidence(self, graph):
+        """search_nodes with min_confidence should filter below threshold."""
+        graph.upsert_node("HighConf", "PERSON", "2026-02-27", confidence=0.9)
+        graph.upsert_node("LowConf", "PERSON", "2026-02-27", confidence=0.3)
+
+        results = graph.search_nodes("", limit=50, min_confidence=0.5)
+        names = [n.name for n in results]
+        assert "HighConf" in names
+        assert "LowConf" not in names
+
+    def test_search_nodes_min_confidence_0_includes_all(self, graph):
+        """search_nodes with min_confidence=0.0 should include all."""
+        graph.upsert_node("HighConf", "PERSON", "2026-02-27", confidence=0.9)
+        graph.upsert_node("LowConf", "PERSON", "2026-02-27", confidence=0.1)
+
+        results = graph.search_nodes("", limit=50, min_confidence=0.0)
+        names = [n.name for n in results]
+        assert "HighConf" in names
+        assert "LowConf" in names
+
+    def test_traverse_enrich_nodes_includes_confidence(self, graph):
+        """traverse should enrich nodes with confidence from kg_nodes."""
+        _add_node(graph, "A")
+        _add_node(graph, "B", confidence=0.6)  # explicit low confidence
+        _add_edge(graph, "A", "B", "KNOWS", 0.8, "", "h1")
+
+        result = graph.traverse("A", max_hops=1)
+        b_node = next(n for n in result.nodes if n.name == "B")
+        assert b_node.confidence == 0.6
+
+    def test_get_canonical_entities_includes_confidence(self, graph):
+        """get_canonical_entities should include confidence field."""
+        graph.upsert_node("Phuc", "PERSON", "2026-02-27", confidence=0.75)
+
+        entities = graph.get_canonical_entities(limit=50)
+        phuc = next(e for e in entities if e["name"] == "Phuc")
+        assert "confidence" in phuc
+        assert phuc["confidence"] == 0.75
+
+    def test_get_all_nodes_includes_confidence(self, graph):
+        """get_all_nodes should include confidence in export."""
+        graph.upsert_node("Phuc", "PERSON", "2026-02-27", confidence=0.65)
+
+        nodes = graph.get_all_nodes()
+        phuc = next(n for n in nodes if n["name"] == "Phuc")
+        assert "confidence" in phuc
+        assert phuc["confidence"] == 0.65
