@@ -1,6 +1,6 @@
 # Search Architecture — How It Works
 
-> Last updated: 2026-03-03 (v0.1.22)
+> Last updated: 2026-04-02 (v0.1.29-dev)
 
 ## Overview
 
@@ -9,31 +9,33 @@
 ## Pipeline
 
 ```
-kioku-lite search "What has Alice been up to?" --limit 5
+kioku-lite search "What has Alice been up to?" --entities "Alice" --limit 5
   ↓
-┌──────────────────────────────────────────────┐
-│  search(query, limit)                        │
-│                                              │
-│  1. Embed Query                              │
-│     └── embed("query: " + text)             │
-│         → 1024-dim query vector              │
-│                                              │
-│  2. Tri-Hybrid Search (parallel)             │
-│     ├── BM25 (SQLite FTS5)                   │
-│     │   keywords extracted from query        │
-│     ├── Semantic (sqlite-vec)                │
-│     │   cosine similarity → query vector     │
-│     └── Graph (SQLite BFS)                   │
-│         entity names detected in query       │
-│         → BFS 1-hop neighbors                │
-│                                              │
-│  3. RRF Reranking                            │
-│     └── Reciprocal Rank Fusion               │
-│         weights: BM25×0.3 + Vec×0.5 + KG×0.2│
-│                                              │
-│  4. Deduplicate + Hydrate                    │
-│     └── Fetch full text from SQLite          │
-└──────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│  search(query, entities, limit, include_hist)   │
+│                                                  │
+│  1. Embed Query                                  │
+│     └── embed("query: " + text)                 │
+│         → 1024-dim query vector                  │
+│                                                  │
+│  2. Tri-Hybrid Search (parallel)                 │
+│     ├── BM25 (SQLite FTS5)                       │
+│     │   keywords extracted from query            │
+│     ├── Semantic (sqlite-vec)                    │
+│     │   cosine similarity → query vector         │
+│     └── Graph (PPR or BFS)                       │
+│         ├─ if --entities: PPR seed on entities   │
+│         │  (entity-focused, multi-hop, weighted) │
+│         └─ else: BFS 1-hop (simple, fast)        │
+│         exclude_historical = not include_hist    │
+│                                                  │
+│  3. RRF Reranking                                │
+│     └── Reciprocal Rank Fusion                   │
+│         weights: BM25×0.3 + Vec×0.5 + KG×0.2     │
+│                                                  │
+│  4. Deduplicate + Hydrate                        │
+│     └── Fetch full text from SQLite              │
+└──────────────────────────────────────────────────┘
   ↓
 [{content, score, source, date, mood, content_hash}, ...]
 ```
@@ -123,9 +125,20 @@ sequenceDiagram
 - **Weight in RRF:** 0.50
 - **Observed contribution:** ~50% — dominant for conceptual queries
 
-### Graph (SQLite BFS)
-- **Strength:** Relationship discovery, entity-linked memories
-- **Method:** Detect entity names in query → BFS 1-hop in kg_relations
+### Graph (PPR or BFS)
+- **Activation:** 
+  - `--entities` provided → PPR (Personalized PageRank)
+  - No `--entities` → BFS 1-hop (default)
+- **PPR (Entity-Focused):**
+  - Seed on provided entities, walk graph with damping=0.85
+  - Multi-hop associative recall, weights by relevance to seeds
+  - E.g., "who does Alice work with?" → ranks co-workers by association strength
+- **BFS (Simple):**
+  - Direct neighbors in kg_edges
+  - Fast, suitable for single-entity recall
+- **Temporal:** 
+  - Excludes `valid_until < today` edges by default
+  - `--include-historical` flag includes superseded facts
 - **Weight in RRF:** 0.20
 - **Observed contribution:** ~20% — critical for person/project queries
 

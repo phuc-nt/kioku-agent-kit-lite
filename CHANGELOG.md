@@ -5,6 +5,36 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Temporal Fact Management**: `valid_from` / `valid_until` columns on `kg_edges`
+  - `kg-invalidate` CLI command: mark facts as superseded with `--source`, `--target`, `--rel-type`, `--date`, `--reason`
+  - `--include-historical` flag on `search`, `recall`, `connect` to include superseded facts
+  - Agent can mark facts as no longer valid and track temporal validity
+- **Memory Consolidation**: decay stale edges and surface old memories
+  - `consolidate` CLI command: `--half-life` (days), `--older-than` (days), `--auto-merge`
+  - Confidence decay: `weight * 0.5^(days/half_life)` with `last_reinforced` tracking
+  - JSON report output: decayed edges, merge suggestions, stale memories (agent-driven action)
+- **Entity Resolution + Auto-Dedup**:
+  - Dual-threshold dedup: vector similarity ≥0.98 AND Jaro-Winkler name ≥0.85 → auto-merge
+  - `dedup-scan` CLI command with optional `--auto` flag
+  - `merge` CLI command: source → target consolidation with audit log
+  - Confidence scoring on entities (0.0–1.0, MAX on upsert)
+  - `kg_merge_log` audit table tracks all merges
+  - `kg-index` response now includes `auto_merged` and `dedup_candidates`
+- **Personalized PageRank (PPR)**:
+  - PPR replaces BFS for entity-focused search (when `--entities` provided)
+  - BFS retained for `recall` / `connect` (untouched)
+  - Pure Python power iteration, damping=0.85
+  - Better multi-hop associative recall for entity-seeded queries
+- **Community/Cluster Detection**:
+  - `clusters` CLI command: list all detected clusters with suggested labels
+  - `cluster <label>` CLI command: show entities and connected memories in a cluster
+  - Connected components via BFS, auto-labeled from most common entity type
+  - Integrated into `consolidate` report for structural analysis
+- 375 tests passing across all new modules
+
 ## [0.1.28] — 2026-03-03
 
 ### Fixed

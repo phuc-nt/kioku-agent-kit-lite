@@ -32,7 +32,11 @@ Most agent memory systems store flat text or vectors. They can't answer *"Why wa
 
 ## Features
 
-- **Tri-hybrid search** — BM25 (FTS5) + Vector (sqlite-vec) + Knowledge Graph
+- **Tri-hybrid search** — BM25 (FTS5) + Vector (sqlite-vec) + Knowledge Graph (PPR for entity-focused queries)
+- **Temporal fact management** — mark facts as superseded, track validity windows with `--include-historical` flag
+- **Memory consolidation** — detect stale edges via confidence decay, surface old memories for summarization
+- **Entity resolution** — auto-dedup via dual-threshold (vector + name similarity), manual merge with audit trail
+- **Community detection** — cluster detection and analysis integrated into consolidation pipeline
 - **Zero infrastructure** — no Docker, no ChromaDB, no external servers
 - **Fully offline** — FastEmbed ONNX embedding, no API keys needed
 - **Agent-driven KG** — agent extracts entities and indexes them (no built-in LLM)
@@ -61,10 +65,19 @@ Full setup guides for each agent type:
 ```
 Agent (Claude Code, Cursor, …)
   │
-  ├─ save "..."          ──→  SQLite FTS5 + sqlite-vec + Markdown backup
-  ├─ kg-index <hash>     ──→  GraphStore (nodes, edges, aliases)
-  └─ search "..."        ──→  BM25 ∪ Vector ∪ KG → RRF rerank
+  ├─ save "..."                ──→  SQLite FTS5 + sqlite-vec + Markdown backup
+  ├─ kg-index <hash>           ──→  GraphStore (nodes, edges, aliases, temporal validity)
+  ├─ kg-invalidate / merge      ──→  Temporal tracking, entity resolution audit
+  ├─ search "..."              ──→  BM25 ∪ Vector ∪ PPR(entities) → RRF rerank
+  ├─ consolidate               ──→  Decay stale edges, detect duplicates, surface old memories
+  └─ clusters / cluster        ──→  Community detection & analysis
 ```
+
+**Temporal & Dedup Layers:**
+- Temporal validity: `kg_edges.valid_from` / `valid_until` — query with `--include-historical`
+- Entity consolidation: auto-dedup via dual threshold (0.98 vector sim + 0.85 name sim)
+- Confidence decay: `weight * 0.5^(days/half_life)` for stale edge detection
+- Cluster-aware consolidation: groups related entities during dedup
 
 > kioku-lite **never calls an LLM**. The agent extracts entities from its own context, keeping the memory engine 100% local and LLM-agnostic.
 

@@ -1,6 +1,6 @@
 # System Architecture — kioku-agent-kit-lite
 
-> Last updated: 2026-03-04 (v0.1.28)
+> Last updated: 2026-04-02 (v0.1.29-dev)
 
 ## Overview
 
@@ -18,11 +18,12 @@ kioku-agent-kit-lite is a personal memory engine for AI agents with a **zero-dep
 │                     INTERFACE LAYER                          │
 │                                                              │
 │   ┌───────────────────────────────────────────────────────┐  │
-│   │  cli.py  (Typer CLI)                                  │  │
-│   │  • save       • kg-index    • kg-alias               │  │
-│   │  • search     • recall      • connect                │  │
-│   │  • entities   • timeline    • users    • setup       │  │
-│   │  • init       • install-profile        • export-graph│  │
+│   │  cli.py  (Typer CLI — 16 commands)                   │  │
+│   │  Write: save kg-index kg-invalidate kg-alias        │  │
+│   │  Query: search recall connect timeline entities      │  │
+│   │  Dedup: dedup-scan merge                             │  │
+│   │  Consolidate: consolidate clusters cluster           │  │
+│   │  System: users setup init install-profile export     │  │
 │   └──────────────────────────┬────────────────────────────┘  │
 │                              │                               │
 └──────────────────────────────┼───────────────────────────────┘
@@ -55,18 +56,23 @@ src/kioku_lite/
 ├── __init__.py
 ├── config.py          # Settings (Pydantic) — env vars KIOKU_LITE_*
 ├── service.py         # KiokuLiteService — all business logic
-├── cli.py             # CLI (Typer) — 12 commands
+├── cli.py             # CLI (Typer) — 16 commands (write, query, dedup, consolidate)
 │
-├── pipeline/          # WRITE path
+├── pipeline/          # WRITE path + consolidation pipeline
 │   ├── db.py          # KiokuDB — facade for SQLiteStore + GraphStore
-│   ├── sqlite_store.py # FTS5 (BM25) + sqlite-vec (vector) tables
-│   ├── graph_store.py  # SQLite KG: entities, relations, aliases
-│   └── embedder.py    # FastEmbedder (ONNX) | OllamaEmbedder | FakeEmbedder
+│   ├── sqlite_store.py # FTS5 (BM25) + sqlite-vec (vector) + temporal tables
+│   ├── graph_store.py  # SQLite KG: entities, relations, aliases, temporal validity
+│   ├── embedder.py    # FastEmbedder (ONNX) | OllamaEmbedder | FakeEmbedder
+│   ├── consolidation.py # Decay & merge detection (confidence decay pipeline)
+│   ├── dedup.py       # Dual-threshold entity deduplication (vec + name sim)
+│   ├── clustering.py  # Connected component detection (BFS-based)
+│   └── models.py      # Data models (ConsolidationReport, DedupeResult, etc.)
 │
 ├── search/            # READ path
 │   ├── bm25.py        # BM25 keyword search (SQLite FTS5)
 │   ├── semantic.py    # Vector similarity (sqlite-vec ANN)
-│   ├── graph.py       # Graph traversal (SQLite BFS)
+│   ├── graph.py       # Graph traversal (SQLite BFS, supports --include-historical)
+│   ├── pagerank.py    # Personalized PageRank (PPR) for entity-focused search
 │   └── reranker.py    # Reciprocal Rank Fusion (RRF)
 │
 └── storage/
@@ -157,6 +163,71 @@ All settings via environment variables with prefix `KIOKU_LITE_`:
 | sqlite-vec extension | Vector search skipped. BM25 + KG still work. |
 | GraphStore | KG search skipped. BM25 + Vector still work. |
 | SQLite | ❌ Critical — all search operations fail |
+
+## Temporal Validity Layer (v0.1.29)
+
+Facts in a personal knowledge graph age and become superseded. kioku-lite tracks validity windows:
+
+| Feature | Implementation |
+|---|---|
+| **Storage** | `kg_edges.valid_from`, `kg_edges.valid_until` |
+| **Invalidation** | `kg-invalidate` CLI: mark edge as no longer valid with date + reason |
+| **Query control** | `--include-historical` flag on `search`, `recall`, `connect` |
+| **Default behavior** | Queries exclude superseded edges unless `--include-historical` is set |
+| **Use case** | Agent marks outdated facts (job change, breakup, resolved issue) without deletion |
+
+Example: "Phuc works at LINE" (valid 2023-01-01 to 2026-03-31) → agent marks `valid_until=2026-03-31` when he changes jobs.
+
+## Confidence Decay & Consolidation (v0.1.29)
+
+Memory systems accumulate stale or weakly-reinforced facts. Consolidation surfaces them for agent action:
+
+| Feature | Formula | Purpose |
+|---|---|---|
+| **Confidence decay** | `weight_t = weight * 0.5^(days_since_reinforced / half_life)` | Reduce signal from rarely-reinforced edges |
+| **Stale detection** | Memories last updated > `--older-than` days | Surface old entries for summarization |
+| **Merge suggestions** | Dual-threshold: vec_sim ≥ 0.98 AND jaro_winkler ≥ 0.85 | Find duplicate entity pairs |
+| **Output** | JSON report: `{decay, merge_suggestions, stale_memories}` | Agent-driven (agent reviews, then acts) |
+
+Run `kioku-lite consolidate --half-life 90 --older-than 30` to surface candidates.
+
+## Entity Resolution & Deduplication (v0.1.29)
+
+Personal KGs suffer from entity aliases and misspellings. kioku-lite auto-dedupes:
+
+| Feature | Details |
+|---|---|
+| **Detection** | Dual threshold: cosine_sim(embedding) ≥ 0.98 AND jaro_winkler(name) ≥ 0.85 |
+| **Auto-merge** | `dedup-scan --auto` merges qualifying pairs automatically |
+| **Manual merge** | `merge <source> <target>` consolidates with audit trail in `kg_merge_log` |
+| **Confidence scoring** | Entities track confidence (0.0–1.0), set to MAX on upsert/merge |
+| **Audit trail** | `kg_merge_log` table records all merges with source, target, timestamp |
+
+Example: "Phuc" (10 mentions) + "Phúc" (3 mentions, 0.99 similarity) → auto-merge into "Phúc".
+
+## Personalized PageRank for Entity-Focused Search (v0.1.29)
+
+When user asks about relationships between specific people/projects, BFS alone misses important indirect connections. PPR reorders by relevance to seed entities:
+
+| Aspect | Details |
+|---|---|
+| **Activation** | When `search --entities "Alice,Bob,Charlie"` is called |
+| **Algorithm** | Pure Python power iteration, damping=0.85 |
+| **Kept untouched** | `recall` and `connect` remain BFS-based (simpler, focused) |
+| **Benefit** | Better multi-hop associative recall (e.g., "who is Alice likely to know?") |
+
+## Community/Cluster Detection (v0.1.29)
+
+KGs fragment into communities (friend groups, project clusters, work domains). Detection helps consolidation:
+
+| Command | Purpose |
+|---|---|
+| `kioku-lite clusters` | List all detected clusters with auto-assigned labels (from most common entity type) |
+| `kioku-lite cluster PERSON` | Show all entities + memories in the PERSON cluster |
+| **Integration** | Clusters included in `consolidate` report for structural analysis |
+| **Method** | Connected components via BFS, O(V+E) |
+
+Example output: `{label: "PERSON", entity_count: 42, memory_count: 156}`
 
 ## Graph Search: Hub Node Fixes (v0.1.27–0.1.28)
 
