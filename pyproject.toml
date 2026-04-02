@@ -1,6 +1,6 @@
 [project]
 name = "kioku-lite"
-version = "0.1.28"
+version = "0.2.0"
 description = "Personal memory engine for AI agents — zero Docker, SQLite-everything (BM25 + sqlite-vec + SQLite graph)"
 readme = "README.md"
 requires-python = ">=3.11"
