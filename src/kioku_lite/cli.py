@@ -545,6 +545,39 @@ def install_profile(
     typer.echo("")
 
 
+# ── clusters ──────────────────────────────────────────────────────────────────
+
+@app.command(name="clusters")
+def clusters_cmd(
+    include_historical: bool = typer.Option(False, "--include-historical", help="Include superseded edges."),
+) -> None:
+    """Detect and list entity clusters in the knowledge graph.
+
+    Groups connected entities into communities and shows each cluster
+    with its suggested label and entity count.
+
+    \b
+    Example:
+      kioku-lite clusters
+    """
+    _out(_get_svc().detect_clusters(include_historical=include_historical))
+
+
+@app.command(name="cluster")
+def cluster_cmd(
+    label: str = typer.Argument(..., help="Cluster label to inspect."),
+) -> None:
+    """Show all entities and connected memories in a named cluster.
+
+    Use 'kioku-lite clusters' first to see available cluster labels.
+
+    \b
+    Example:
+      kioku-lite cluster PERSON
+    """
+    _out(_get_svc().get_cluster(label))
+
+
 # ── consolidate ───────────────────────────────────────────────────────────────
 
 @app.command()

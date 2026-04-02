@@ -465,6 +465,57 @@ class GraphStore:
         return {"status": "merged", "source": source, "target": target,
                 "merge_type": merge_type, "vector_sim": vector_sim, "name_sim": name_sim}
 
+    # ── Clusters ───────────────────────────────────────────────────────────────
+
+    def save_clusters(self, clusters) -> None:
+        """Persist communities to kg_clusters (clear-and-reinsert).
+
+        clusters: list[Community] from kioku_lite.pipeline.clustering
+        """
+        cur = self.conn.cursor()
+        cur.execute("DELETE FROM kg_clusters")
+        for cluster in clusters:
+            for entity in cluster.entities:
+                cur.execute(
+                    "INSERT OR IGNORE INTO kg_clusters (cluster_id, label, entity_name) VALUES (?, ?, ?)",
+                    (cluster.id, cluster.label, entity),
+                )
+        self.conn.commit()
+
+    def get_clusters(self) -> list[dict]:
+        """Return all clusters with entity counts, grouped by cluster_id."""
+        cur = self.conn.cursor()
+        cur.execute(
+            """
+            SELECT cluster_id, label, COUNT(*) as entity_count
+            FROM kg_clusters
+            GROUP BY cluster_id, label
+            ORDER BY entity_count DESC
+            """
+        )
+        return [
+            {"cluster_id": r[0], "label": r[1], "entity_count": r[2]}
+            for r in cur.fetchall()
+        ]
+
+    def get_cluster_entities(self, cluster_label: str) -> list[str]:
+        """Return all entity names belonging to the first cluster matching label."""
+        cur = self.conn.cursor()
+        # Find the cluster_id for the given label
+        cur.execute(
+            "SELECT cluster_id FROM kg_clusters WHERE label = ? COLLATE NOCASE LIMIT 1",
+            (cluster_label,),
+        )
+        row = cur.fetchone()
+        if not row:
+            return []
+        cluster_id = row[0]
+        cur.execute(
+            "SELECT entity_name FROM kg_clusters WHERE cluster_id = ?",
+            (cluster_id,),
+        )
+        return [r[0] for r in cur.fetchall()]
+
     # ── Export ─────────────────────────────────────────────────────────────────
 
     def get_all_nodes(self) -> list[dict]:

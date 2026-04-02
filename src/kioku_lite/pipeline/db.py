@@ -177,6 +177,19 @@ class KiokuDB:
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_alias ON kg_aliases(alias COLLATE NOCASE)")
         cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_canonical ON kg_aliases(canonical COLLATE NOCASE)")
 
+        # Cluster table — refreshed on each clustering run
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS kg_clusters (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cluster_id INTEGER NOT NULL,
+                label TEXT NOT NULL,
+                entity_name TEXT NOT NULL,
+                UNIQUE(cluster_id, entity_name)
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_clusters_label ON kg_clusters(label COLLATE NOCASE)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_kg_clusters_entity ON kg_clusters(entity_name COLLATE NOCASE)")
+
         # Merge audit log
         cur.execute("""
             CREATE TABLE IF NOT EXISTS kg_merge_log (

@@ -529,6 +529,11 @@ class KiokuLiteService:
         cutoff = stale_cutoff(older_than_days)
         stale = self.db.memory.get_timeline(end_date=cutoff.isoformat(), limit=50)
 
+        # Step 4: cluster detection (lightweight — just count)
+        from kioku_lite.pipeline.clustering import find_communities
+        communities = find_communities(self.db.conn)
+        self.db.graph.save_clusters(communities)
+
         return {
             "decay": build_decay_report(decayed, half_life_days),
             "merge_suggestions": {
@@ -536,6 +541,61 @@ class KiokuLiteService:
                 "auto_merged": dedup_result.get("auto_merged", []),
             },
             "stale_memories": build_stale_report(stale, cutoff),
+            "clusters": {
+                "cluster_count": len(communities),
+                "total_entities": sum(len(c.entities) for c in communities),
+            },
+        }
+
+    # ── cluster detection ──────────────────────────────────────────────────────
+
+    def detect_clusters(self, include_historical: bool = False) -> dict:
+        """Run connected-component clustering, persist results, return summary."""
+        from kioku_lite.pipeline.clustering import find_communities
+
+        communities = find_communities(self.db.conn, include_historical=include_historical)
+        self.db.graph.save_clusters(communities)
+
+        return {
+            "status": "clustered",
+            "cluster_count": len(communities),
+            "total_entities": sum(len(c.entities) for c in communities),
+            "clusters": [
+                {
+                    "cluster_id": c.id,
+                    "label": c.label,
+                    "entity_count": len(c.entities),
+                    "edge_count": c.edge_count,
+                }
+                for c in communities
+            ],
+        }
+
+    def get_cluster(self, label: str) -> dict:
+        """Return entities in the named cluster and their connected memories."""
+        entities = self.db.graph.get_cluster_entities(label)
+        if not entities:
+            return {"status": "not_found", "label": label, "entities": [], "memories": []}
+
+        hashes: set[str] = set()
+        for entity in entities:
+            result = self.db.graph.traverse(entity, max_hops=1, limit=20)
+            for edge in result.edges:
+                if edge.source_hash:
+                    hashes.add(edge.source_hash)
+
+        hydrated = self.db.memory.get_by_hashes(list(hashes)) if hashes else {}
+
+        return {
+            "status": "ok",
+            "label": label,
+            "entity_count": len(entities),
+            "entities": entities,
+            "memory_count": len(hydrated),
+            "memories": [
+                {"content": v["text"], "date": v.get("date", ""), "content_hash": k}
+                for k, v in hydrated.items()
+            ],
         }
 
     # ── export ─────────────────────────────────────────────────────────────────
